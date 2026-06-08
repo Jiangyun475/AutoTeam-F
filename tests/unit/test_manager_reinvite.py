@@ -1,6 +1,22 @@
-import types
-
 from autoteam import accounts, manager
+
+
+class FakeTeamApi:
+    def __init__(self, *, started=False):
+        self.browser = started
+        self.stopped = False
+        self.started = False
+
+    def is_started(self):
+        return bool(self.browser or self.started)
+
+    def start(self):
+        self.started = True
+        self.browser = True
+
+    def stop(self):
+        self.stopped = True
+        self.browser = False
 
 
 def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch):
@@ -36,6 +52,13 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
     )
     monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "wsk-1")
     monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_wait_for_invite_link", lambda *_args, **_kwargs: "https://invite.example")
+    monkeypatch.setattr(
+        manager,
+        "_accept_existing_account_team_invite",
+        lambda _email, password, *_args, **_kwargs: password,
+    )
     monkeypatch.setattr(
         manager,
         "_is_email_in_team",
@@ -43,7 +66,7 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
     )
 
     result = manager.reinvite_account(
-        types.SimpleNamespace(browser=False),
+        FakeTeamApi(started=False),
         None,
         {"email": "tmp-user@example.com", "password": "secret"},
     )
@@ -96,6 +119,13 @@ def test_reinvite_account_stops_http_transport_session_before_oauth(monkeypatch)
     monkeypatch.setattr(manager, "check_codex_quota", lambda token: ("ok", {"primary_pct": 0}))
     monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "wsk-1")
     monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_wait_for_invite_link", lambda *_args, **_kwargs: "https://invite.example")
+    monkeypatch.setattr(
+        manager,
+        "_accept_existing_account_team_invite",
+        lambda _email, password, *_args, **_kwargs: password,
+    )
 
     result = manager.reinvite_account(
         api,
@@ -170,6 +200,13 @@ def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(m
         "update_account",
         lambda email, **kwargs: updates.append((email, kwargs)),
     )
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_wait_for_invite_link", lambda *_args, **_kwargs: "https://invite.example")
+    monkeypatch.setattr(
+        manager,
+        "_accept_existing_account_team_invite",
+        lambda _email, password, *_args, **_kwargs: password,
+    )
     monkeypatch.setattr(
         manager,
         "_is_email_in_team",
@@ -177,7 +214,7 @@ def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(m
     )
 
     result = manager.reinvite_account(
-        types.SimpleNamespace(browser=False),
+        FakeTeamApi(started=False),
         None,
         {"email": "tmp-user@example.com", "password": ""},
     )

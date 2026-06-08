@@ -259,6 +259,7 @@ def test_get_team_members_api_uses_normalized_team_shape_helpers(monkeypatch):
                 "role": "admin",
                 "user_id": "user-1",
                 "is_local": True,
+                "matched_by_user_id": False,
                 "type": "member",
             },
             {

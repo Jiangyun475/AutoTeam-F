@@ -479,6 +479,7 @@ def test_create_new_account_uses_domain_auto_join_before_invite(monkeypatch):
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         manager,
@@ -499,6 +500,7 @@ def test_create_new_account_invite_first_mode_preserves_invite_order(monkeypatch
     events = []
 
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "invite_first")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or "new@example.com")
     monkeypatch.setattr(
         manager,
@@ -520,6 +522,7 @@ def test_create_new_account_domain_auto_join_falls_back_to_invite(monkeypatch):
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
     monkeypatch.setenv("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", "true")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(manager, "create_account_direct", lambda *_args, **_kwargs: events.append("direct") or None)
     monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or "new@example.com")
@@ -537,6 +540,7 @@ def test_create_new_account_does_not_retry_direct_after_invite_fallback_failure(
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(manager, "create_account_direct", lambda *_args, **_kwargs: events.append("direct") or None)
     monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or None)
@@ -552,6 +556,7 @@ def test_create_new_account_domain_auto_join_respects_allowlist(monkeypatch):
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "other.example")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         manager,
         "create_account_direct",
