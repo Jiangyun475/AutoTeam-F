@@ -15,6 +15,7 @@ def test_get_sync_target_states_uses_implicit_config_presence():
     assert sync_targets.get_sync_target_states(env) == {
         "cpa": True,
         "sub2api": True,
+        "local_codex": False,
     }
 
 
@@ -29,12 +30,19 @@ def test_get_sync_target_states_respects_explicit_toggle_override():
     assert sync_targets.get_sync_target_states(env) == {
         "cpa": False,
         "sub2api": True,
+        "local_codex": False,
     }
+
+
+def test_get_sync_target_states_enables_local_codex_only_when_explicit():
+    assert sync_targets.get_sync_target_states({})["local_codex"] is False
+    assert sync_targets.get_sync_target_states({"SYNC_TARGET_LOCAL_CODEX": "true"})["local_codex"] is True
 
 
 def test_describe_sync_targets_formats_labels():
     assert sync_targets.describe_sync_targets(["cpa"]) == "CPA"
     assert sync_targets.describe_sync_targets(["cpa", "sub2api"]) == "CPA + Sub2API"
+    assert sync_targets.describe_sync_targets(["local_codex"]) == "本机 Codex CLI"
 
 
 def test_sync_account_to_configured_targets_uploads_one_active_auth(monkeypatch, tmp_path):

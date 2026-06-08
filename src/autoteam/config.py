@@ -103,6 +103,7 @@ SUB2API_MODEL_WHITELIST = _get_str_env("SUB2API_MODEL_WHITELIST", "")
 SUB2API_OPENAI_WS_MODE = _normalize_sub2api_ws_mode(_get_str_env("SUB2API_OPENAI_WS_MODE", "off"))
 SUB2API_OPENAI_PASSTHROUGH = _get_bool_env("SUB2API_OPENAI_PASSTHROUGH", False)
 SUB2API_OVERWRITE_ACCOUNT_SETTINGS = _get_bool_env("SUB2API_OVERWRITE_ACCOUNT_SETTINGS", False)
+LOCAL_CODEX_AUTH_PATH = _get_str_env("LOCAL_CODEX_AUTH_PATH", "~/.codex/auth.json")
 
 
 # Round 12 S3 — auth_repair 状态机配置(cherry-pick from upstream).
@@ -115,6 +116,7 @@ AUTO_CHECK_ADD_PHONE_MAX_RETRIES = _get_int_env("AUTO_CHECK_ADD_PHONE_MAX_RETRIE
 
 # 默认不复用旧/失败/退役子号。Team 满员需要替换时必须先移出旧 child，再创建新 child。
 ROTATE_SKIP_REUSE = _get_bool_env("ROTATE_SKIP_REUSE", True)
+ROTATE_ALLOW_NEW_ACCOUNTS = _get_bool_env("ROTATE_ALLOW_NEW_ACCOUNTS", True)
 ROTATE_NEW_ACCOUNT_MODE = _normalize_rotate_new_account_mode(
     _get_str_env("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
 )

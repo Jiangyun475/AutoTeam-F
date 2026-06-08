@@ -11,7 +11,7 @@ cp .env.example .env
 | 配置项 | 说明 | 必填 |
 |--------|------|------|
 | `MAIL_PROVIDER` | 临时邮箱后端,`cf_temp_email`(默认) 或 `maillab` | **是(默认 `cf_temp_email`)** |
-| `CLOUDMAIL_BASE_URL` | cf_temp_email 后端的 API 地址，必须包含 `/api` 前缀(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
+| `CLOUDMAIL_BASE_URL` | cf_temp_email Worker 根地址，不要追加 `/api`(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
 | `CLOUDMAIL_PASSWORD` | cf_temp_email 后端的管理员密码(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
 | `CLOUDMAIL_DOMAIN` | 临时邮箱域名(如 `@example.com`,Web 面板可填) | 是 |
 | `CLOUDMAIL_EMAIL` | 已废弃,保留只为兼容旧 `.env`;不再被使用 | 否 |
@@ -120,7 +120,7 @@ MAILLAB_DOMAIN=@example.com
 | `error_code` | 说明 | 修复方向 |
 |---|---|---|
 | `PROVIDER_MISMATCH` | base_url 指纹与所选 provider 不匹配 | 切到正确的 provider 后重试 |
-| `ROUTE_NOT_FOUND` | base_url 不是任何已知后端 | 检查 URL 是否包含 /api 前缀 / 协议是否正确 |
+| `ROUTE_NOT_FOUND` | base_url 不是任何已知后端 | 检查 URL 拼写、协议、反向代理路径是否正确 |
 | `EMPTY_DOMAIN_LIST` | maillab `domainList` 空 | 在 maillab 管理后台先添加可用域名 |
 | `UNAUTHORIZED` | 凭据校验失败 | 重置密码或排查管理员账号 |
 | `CAPTCHA_REQUIRED` | maillab 启用了登录验证码 | 暂时关闭 captcha 或改用 admin 直登 |

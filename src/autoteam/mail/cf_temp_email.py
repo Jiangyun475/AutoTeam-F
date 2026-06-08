@@ -35,8 +35,11 @@ logger = logging.getLogger(__name__)
 def normalize_cloudflare_temp_email_base_url(value: str | None) -> str:
     """Normalize a cf_temp_email base URL without changing the provider package shape."""
     base_url = (value or "").strip().rstrip("/")
-    if base_url.lower().endswith("/admin"):
-        base_url = base_url[:-6].rstrip("/")
+    lowered = base_url.lower()
+    for suffix in ("/admin", "/api"):
+        if lowered.endswith(suffix):
+            base_url = base_url[: -len(suffix)].rstrip("/")
+            break
     return base_url
 
 
@@ -304,6 +307,7 @@ class CfTempEmailClient(MailProvider):
             "content": html_body,
             "messageId": message_id or row.get("message_id"),
             "createTime": row.get("created_at"),
+            "metadata": row.get("metadata"),
             "raw": raw,
         }
 

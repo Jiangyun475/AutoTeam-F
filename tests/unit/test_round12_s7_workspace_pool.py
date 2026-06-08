@@ -196,6 +196,30 @@ def test_mark_healthy_resets_fail_count(pool: WorkspacePool):
     assert a["status"] == STATUS_HEALTHY
 
 
+def test_master_health_signal_recovers_when_active_pointer_missing(pool: WorkspacePool):
+    from autoteam.master_health import apply_pool_health_signal
+
+    pool.register("ws-a", "ad1@example.com", UUID_A)
+    raw = json.loads(pool.path.read_text(encoding="utf-8"))
+    raw["active"] = None
+    raw["workspaces"][0]["tier"] = TIER_COLD
+    raw["workspaces"][0]["status"] = STATUS_UNHEALTHY
+    raw["workspaces"][0]["fail_count"] = 3
+    pool.path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+    snap = apply_pool_health_signal(
+        True,
+        "subscription_grace",
+        {"account_id": UUID_A},
+        pool=pool,
+    )
+
+    assert snap["id"] == "ws-a"
+    assert pool.get_active()["id"] == "ws-a"
+    assert pool.get("ws-a")["status"] == STATUS_HEALTHY
+    assert pool.get("ws-a")["fail_count"] == 0
+
+
 # ---------------------------------------------------------------------------
 # 4. transition_log
 # ---------------------------------------------------------------------------

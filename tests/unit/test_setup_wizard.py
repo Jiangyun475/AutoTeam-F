@@ -86,3 +86,16 @@ def test_check_and_setup_non_interactive_reports_missing_required_fields(tmp_pat
     assert "[配置] 缺少必填项: PLAYWRIGHT_PROXY_BYPASS" not in caplog.text
     assert "[配置] 缺少必填项: API_KEY" in caplog.text
     assert "[配置] 请通过 Web 面板或编辑 .env 文件填入配置" in caplog.text
+
+
+def test_verify_cpa_skips_when_sync_target_disabled(monkeypatch):
+    monkeypatch.setenv("SYNC_TARGET_CPA", "false")
+    monkeypatch.setenv("CPA_URL", "http://127.0.0.1:8317")
+    monkeypatch.setenv("CPA_KEY", "placeholder")
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("disabled CPA target must not be probed")
+
+    monkeypatch.setattr("requests.get", _boom)
+
+    assert setup_wizard._verify_cpa() is True

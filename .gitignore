@@ -7,7 +7,10 @@ screenshots/
 auth_state/
 auths/
 accounts.json
+accounts/
 state.json
+state_log.jsonl
+workspaces.json
 session
 bearer_token
 test.py

@@ -26,7 +26,7 @@ _MISSING = object()
 
 
 def _make_client(monkeypatch):
-    monkeypatch.setenv("CLOUDMAIL_BASE_URL", "https://example.com/api")
+    monkeypatch.setenv("CLOUDMAIL_BASE_URL", "https://example.com")
     monkeypatch.setenv("CLOUDMAIL_PASSWORD", "secret")
     monkeypatch.setenv("CLOUDMAIL_DOMAIN", "@example.com")
     return mod.CfTempEmailClient()

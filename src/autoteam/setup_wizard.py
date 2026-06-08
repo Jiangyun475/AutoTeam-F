@@ -25,7 +25,7 @@ REQUIRED_CONFIGS = [
         True,
     ),
     # cf_temp_email 字段(provider=cf_temp_email 时必填,api.get_setup_status 按 provider 动态切 optional)
-    ("CLOUDMAIL_BASE_URL", "CloudMail API 地址（cf_temp_email 后端，必须包含 /api）", "", False),
+    ("CLOUDMAIL_BASE_URL", "CloudMail API 地址（cf_temp_email Worker 根地址，不要追加 /api）", "", False),
     ("CLOUDMAIL_PASSWORD", "CloudMail 管理员密码（cf_temp_email 后端）", "", False),
     ("CLOUDMAIL_DOMAIN", "邮箱域名（如 @example.com）", "", False),
     # maillab 字段(SPEC-1 §3.4;provider=maillab 时必填,默认 optional 由 setup_status 动态切换)
@@ -335,6 +335,12 @@ def _verify_cloudmail():
 
 def _verify_cpa():
     """验证 CPA 配置是否正确：获取认证文件列表"""
+    from autoteam.sync_targets import SYNC_TARGET_CPA, is_sync_target_enabled
+
+    if not is_sync_target_enabled(SYNC_TARGET_CPA):
+        logger.info("[验证] CPA 同步目标未启用，跳过 CPA 连通性验证")
+        return True
+
     cpa_url = os.environ.get("CPA_URL", "")
     cpa_key = os.environ.get("CPA_KEY", "")
 
@@ -346,7 +352,9 @@ def _verify_cpa():
     try:
         import requests
 
-        resp = requests.get(
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.get(
             f"{cpa_url}/v0/management/auth-files",
             headers={"Authorization": f"Bearer {cpa_key}"},
             timeout=10,

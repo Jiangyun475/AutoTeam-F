@@ -22,7 +22,11 @@ from autoteam.admin_state import (
     get_chatgpt_workspace_name,
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
-from autoteam.config import get_playwright_context_options, get_playwright_launch_options
+from autoteam.config import (
+    get_chatgpt_http_proxy_url,
+    get_playwright_context_options,
+    get_playwright_launch_options,
+)
 from autoteam.invite import (  # SPEC-2 shared/add-phone-detection §3 — OAuth 流程复用
     RegisterBlocked,
     assert_not_blocked,
@@ -1054,6 +1058,73 @@ def _click_primary_auth_button(page, field, labels):
     try:
         field.press("Enter")
         return True
+    except Exception:
+        return False
+
+
+def _click_oauth_consent_continue(page, timeout=5000) -> bool:
+    """
+    Click the primary OAuth consent action without touching cancel/back buttons.
+    Auth0/OpenAI has changed this page a few times; prefer accessible buttons,
+    then fall back to a DOM text scan for the visible primary action.
+    """
+    labels = (
+        "Continue",
+        "继续",
+        "Allow",
+        "Authorize",
+        "Approve",
+        "同意",
+        "授权",
+        "Continue to Codex",
+        "Sign in to Codex with ChatGPT",
+    )
+    label_re = re.compile(rf"^(?:{'|'.join(re.escape(label) for label in labels)})$", re.I)
+
+    for getter in (
+        lambda: page.get_by_role("button", name=label_re).last,
+        lambda: page.locator(
+            'button:has-text("Continue"), button:has-text("继续"), '
+            'button:has-text("Allow"), button:has-text("Authorize"), '
+            'button:has-text("Approve"), button:has-text("同意"), button:has-text("授权"), '
+            'button[type="submit"], input[type="submit"]'
+        ).last,
+    ):
+        try:
+            btn = getter()
+            if btn.is_visible(timeout=timeout) and btn.is_enabled(timeout=1000):
+                btn.click()
+                return True
+        except Exception:
+            continue
+
+    try:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const positive = [
+                    'continue', 'allow', 'authorize', 'approve', 'proceed',
+                    '继续', '同意', '授权'
+                  ];
+                  const negative = ['cancel', 'back', '取消', '返回'];
+                  const nodes = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+                  for (const el of nodes.reverse()) {
+                    const text = ((el.innerText || el.value || el.getAttribute('aria-label') || '') + '').trim().toLowerCase();
+                    if (!text || negative.some(token => text.includes(token))) continue;
+                    if (!positive.some(token => text.includes(token))) continue;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    if (style.visibility === 'hidden' || style.display === 'none' || rect.width <= 0 || rect.height <= 0) continue;
+                    if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+                    el.click();
+                    return true;
+                  }
+                  return false;
+                }
+                """
+            )
+        )
     except Exception:
         return False
 
@@ -2681,7 +2752,8 @@ def login_codex_via_browser(
                     logger.info("[Codex] 检测到账号选择页 (step %d)，尝试选择: %s", step + 1, email)
                     selected = _select_oauth_account(page, email)
                     _screenshot(page, f"codex_04_choose_account_{step + 1}_after.png")
-                    if selected and not _is_choose_account_page(page):
+                    if selected:
+                        time.sleep(2)
                         continue
                     if not selected:
                         logger.warning("[Codex] 无法自动选择 OAuth 账号: %s (step %d)", email, step + 1)
@@ -2911,19 +2983,20 @@ def login_codex_via_browser(
             except Exception:
                 pass
 
-            try:
-                consent_btn = page.locator(
-                    'button:has-text("继续"), button:has-text("Continue"), button:has-text("Allow")'
-                ).first
-                if consent_btn.is_visible(timeout=5000):
-                    logger.info("[Codex] 点击同意/继续按钮 (step %d)...", step + 1)
-                    consent_btn.click()
-                    time.sleep(5)
-                    _screenshot(page, f"codex_04_consent_{step + 1}.png")
-                else:
-                    break
-            except Exception:
-                break
+            if _click_oauth_consent_continue(page, timeout=5000):
+                logger.info("[Codex] 点击同意/继续按钮 (step %d)...", step + 1)
+                time.sleep(5)
+                _screenshot(page, f"codex_04_consent_{step + 1}.png")
+                continue
+
+            time.sleep(2)
+            if _click_oauth_consent_continue(page, timeout=2000):
+                logger.info("[Codex] 页面稳定后点击同意/继续按钮 (step %d)...", step + 1)
+                time.sleep(5)
+                _screenshot(page, f"codex_04_consent_{step + 1}.png")
+                continue
+
+            break
 
         # Round 11 二轮 — pre-consent workspace_select 已前置(line 632+);此处作为兜底:
         # consent loop 自然结束(auth_code 未抓到,可能 workspace_select 仍未触发后端 default 切换)
@@ -3184,18 +3257,18 @@ def login_codex_via_browser(
                         pass
 
                     # 同意/继续按钮
-                    try:
-                        consent_btn = stage2_page.locator(
-                            'button:has-text("继续"), button:has-text("Continue"), button:has-text("Allow")'
-                        ).first
-                        if consent_btn.is_visible(timeout=5000):
-                            logger.info("[Codex] 阶段 2 点击同意按钮 (step %d)", s2_step + 1)
-                            consent_btn.click()
-                            time.sleep(5)
-                        else:
-                            break
-                    except Exception:
-                        break
+                    if _click_oauth_consent_continue(stage2_page, timeout=5000):
+                        logger.info("[Codex] 阶段 2 点击同意按钮 (step %d)", s2_step + 1)
+                        time.sleep(5)
+                        continue
+
+                    time.sleep(2)
+                    if _click_oauth_consent_continue(stage2_page, timeout=2000):
+                        logger.info("[Codex] 阶段 2 页面稳定后点击同意按钮 (step %d)", s2_step + 1)
+                        time.sleep(5)
+                        continue
+
+                    break
 
                 # 等 callback
                 for _ in range(30):
@@ -4310,10 +4383,17 @@ def check_codex_quota(access_token, account_id=None):
         headers["Chatgpt-Account-Id"] = account_id
 
     try:
+        proxy_url = get_chatgpt_http_proxy_url()
+        request_kwargs = {
+            "headers": headers,
+            "timeout": 30,
+        }
+        if proxy_url:
+            request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+
         resp = requests.get(
             "https://chatgpt.com/backend-api/wham/usage",
-            headers=headers,
-            timeout=30,
+            **request_kwargs,
         )
     except (
         requests.exceptions.ConnectionError,

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 DEFAULT_POOL_FILE = PROJECT_ROOT / "workspaces.json"
-POOL_FILE_MODE = 0o666
+POOL_FILE_MODE = 0o600
 
 SCHEMA_VERSION = 1
 

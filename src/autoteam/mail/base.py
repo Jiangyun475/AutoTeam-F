@@ -26,10 +26,13 @@ from autoteam.config import EMAIL_POLL_INTERVAL, EMAIL_POLL_TIMEOUT
 logger = logging.getLogger(__name__)
 
 
-_VERIFICATION_CODE_PATTERNS = (
-    r"(?:temporary\s+(?:openai|chatgpt)\s+login\s+code(?:\s+is)?|verification\s+code(?:\s+is)?|login\s+code(?:\s+is)?|code(?:\s+is)?|验证码(?:为|是)?)\D{0,24}(\d{6})",
-    r"\b(\d{6})\b",
+_VERIFICATION_CONTEXT_PATTERNS = (
+    r"(?:temporary\s+)?(?:openai|chatgpt)\s+(?:login\s+)?code(?:\s+is)?\D{0,80}(\d{6})",
+    r"(?:verification|login|security|one[-\s]?time|auth(?:entication)?)\s+code(?:\s+is)?\D{0,80}(\d{6})",
+    r"(?:验证码|一次性代码|登录代码|安全代码)(?:\s*(?:为|是|:|：))?\D{0,40}(\d{6})",
+    r"\b(\d{6})\b\D{0,60}(?:is\s+your|your)\s+(?:temporary\s+)?(?:openai|chatgpt)?\s*(?:login|verification|security|one[-\s]?time)?\s*code\b",
 )
+_STANDALONE_CODE_RE = re.compile(r"(?<![\w-])(\d{6})(?![\w-])")
 
 
 @dataclass
@@ -176,6 +179,17 @@ def _metadata_ai_extract_result(email_data: dict, expected_type: str) -> str | N
     return result or None
 
 
+def _unique_standalone_code(source: str) -> str | None:
+    codes = []
+    seen = set()
+    for match in _STANDALONE_CODE_RE.finditer(source or ""):
+        code = match.group(1)
+        if code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes[0] if len(codes) == 1 else None
+
+
 # ----------------------------------------------------------------------- ABC
 
 
@@ -264,19 +278,24 @@ class MailProvider(ABC):
         if plain_text:
             sources.append(plain_text)
 
-        subject = str(email_data.get("subject") or "").strip()
-        if subject and subject not in sources:
-            sources.append(subject)
-
         html_text = html_to_visible_text(email_data.get("content"))
         if html_text and html_text not in sources:
             sources.append(html_text)
 
+        subject = str(email_data.get("subject") or "").strip()
+        if subject and subject not in sources:
+            sources.append(subject)
+
         for source in sources:
-            for pattern in _VERIFICATION_CODE_PATTERNS:
+            for pattern in _VERIFICATION_CONTEXT_PATTERNS:
                 match = re.search(pattern, source, re.IGNORECASE)
                 if match:
                     return match.group(1)
+
+        for source in sources:
+            code = _unique_standalone_code(source)
+            if code:
+                return code
         return None
 
     def extract_invite_link(self, email_data: dict) -> str | None:

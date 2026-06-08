@@ -135,7 +135,9 @@ def _collect_cliproxy_health(*, timeout: float, provider: str, model: str) -> di
 
     started = time.monotonic()
     try:
-        response = requests.get(
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(
             f"{base_url}/v0/management/auth-files",
             headers={"Authorization": f"Bearer {CPA_KEY}"},
             timeout=timeout,

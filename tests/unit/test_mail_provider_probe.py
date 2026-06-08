@@ -166,6 +166,25 @@ def test_credentials_captcha_required(monkeypatch):
     assert ei.value.error_code == "CAPTCHA_REQUIRED"
 
 
+def test_credentials_cf_temp_email_uses_admin_address_pagination(monkeypatch):
+    """cf_temp_email admin/address 需要 limit/offset 参数。"""
+
+    def fake_get(url, **kw):
+        assert url == "https://cf.example.com/admin/address"
+        assert kw["params"] == {"limit": 1, "offset": 0}
+        assert kw["headers"]["x-admin-auth"] == "secret"
+        return _Resp({"results": []})
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+    result = mod.probe_credentials(
+        "https://cf.example.com/api",
+        "cf_temp_email",
+        admin_password="secret",
+    )
+    assert result.ok
+    assert result.is_admin is True
+
+
 # ----------------------------------------------------------------- domain ownership
 
 
@@ -228,3 +247,28 @@ def test_domain_ownership_leaked_probe(monkeypatch):
     assert result.cleaned is False
     assert result.leaked_probe is not None
     assert result.leaked_probe["acct_id"] == 99
+
+
+def test_domain_ownership_cf_temp_email_deletes_by_path(monkeypatch):
+    """cf_temp_email admin/delete_address 使用 /:id 路由。"""
+
+    def fake_post(url, **kw):
+        assert url == "https://cf.example.com/admin/new_address"
+        assert kw["json"]["domain"] == "x.com"
+        return _Resp({"address": "probe@x.com", "address_id": 123})
+
+    def fake_delete(url, **kw):
+        assert url == "https://cf.example.com/admin/delete_address/123"
+        assert "params" not in kw
+        return _Resp({"success": True})
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+    monkeypatch.setattr(mod.requests, "delete", fake_delete)
+    result = mod.probe_domain_ownership(
+        "https://cf.example.com/api",
+        "cf_temp_email",
+        admin_password="secret",
+        domain="x.com",
+    )
+    assert result.ok
+    assert result.cleaned is True

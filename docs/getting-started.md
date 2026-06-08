@@ -41,13 +41,13 @@ MAILLAB_DOMAIN=@your-domain.com
 适配 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email),基于 Cloudflare Workers,搭建简单。
 
 按官方文档完成部署后你会得到:
-- API 地址(如 `https://your-domain.com/api`)→ `CLOUDMAIL_BASE_URL`
+- API 地址(如 `https://your-domain.com`)→ `CLOUDMAIL_BASE_URL`
 - 管理员密码(`x-admin-auth`)→ `CLOUDMAIL_PASSWORD`
 - 邮箱域名(如 `@your-domain.com`)→ `CLOUDMAIL_DOMAIN`
 
 ```dotenv
 MAIL_PROVIDER=cf_temp_email
-CLOUDMAIL_BASE_URL=https://your-domain.com/api
+CLOUDMAIL_BASE_URL=https://your-domain.com
 CLOUDMAIL_PASSWORD=your_password
 CLOUDMAIL_DOMAIN=@your-domain.com
 ```

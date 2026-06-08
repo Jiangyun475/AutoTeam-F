@@ -1,4 +1,6 @@
 from autoteam import manager
+import base64
+import json
 
 
 class _FakeChatGPT:
@@ -21,6 +23,89 @@ class _FakeMailClient:
         return None
 
 
+class _FakeTeamApi:
+    def __init__(self, members):
+        self.members = members
+        self.deleted = []
+
+    def _api_fetch(self, method, path, body=None):
+        if method == "GET" and path.endswith("/users"):
+            return {"status": 200, "body": json.dumps({"items": self.members})}
+        if method == "DELETE" and "/users/" in path:
+            self.deleted.append(path.rsplit("/", 1)[-1])
+            return {"status": 200, "body": "{}"}
+        return {"status": 404, "body": "{}"}
+
+
+def _jwt_with_chatgpt_user_id(user_id):
+    payload = {
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": user_id,
+        }
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"header.{encoded}.signature"
+
+
+def test_remove_from_team_does_not_match_hidden_email_by_display_name(monkeypatch):
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(manager, "_email_matches_current_mail_domain", lambda email: email.endswith("@yunfei.life"))
+    monkeypatch.setattr(manager, "_chatgpt_user_id_for_email", lambda _email: "")
+
+    api = _FakeTeamApi(
+        [
+            {"id": "owner-1", "email": "owner@example.com", "role": "account-owner", "name": "Owner"},
+            {"id": "user-hidden", "email": None, "role": "standard-user", "name": "ten"},
+        ]
+    )
+
+    result = manager.remove_from_team(
+        api,
+        "yun10@yunfei.life",
+        return_status=True,
+        lookup_retries=0,
+        retry_interval=0,
+    )
+
+    assert result == "hidden_unmatched"
+    assert api.deleted == []
+
+
+def test_remove_from_team_matches_hidden_email_by_auth_user_id(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-yun10@yunfei.life-team.json"
+    auth_file.write_text(
+        json.dumps({"access_token": _jwt_with_chatgpt_user_id("user-hidden")}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        manager,
+        "load_accounts",
+        lambda: [{"email": "yun10@yunfei.life", "auth_file": str(auth_file)}],
+    )
+
+    api = _FakeTeamApi(
+        [
+            {"id": "owner-1", "email": "owner@example.com", "role": "account-owner", "name": "Owner"},
+            {"id": "user-hidden", "email": None, "role": "standard-user", "name": "ten"},
+        ]
+    )
+
+    result = manager.remove_from_team(
+        api,
+        "yun10@yunfei.life",
+        return_status=True,
+        lookup_retries=0,
+        retry_interval=0,
+    )
+
+    assert result == "removed"
+    assert api.deleted == ["user-hidden"]
+
+
 def test_cmd_rotate_skips_google_accounts_during_auto_reuse(monkeypatch):
     import autoteam.config as config
 
@@ -34,7 +119,8 @@ def test_cmd_rotate_skips_google_accounts_during_auto_reuse(monkeypatch):
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", lambda: [])
-    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(count_values))
+    monkeypatch.setattr(manager, "get_team_occupancy_count", lambda _chatgpt: next(count_values))
+    monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_a, **_kw: True)
     monkeypatch.setattr(
         manager,
         "get_standby_accounts",
@@ -75,7 +161,7 @@ def test_cmd_rotate_can_defer_final_sync_when_running_as_api_task(monkeypatch):
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", lambda: [])
-    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: 3)
+    monkeypatch.setattr(manager, "get_team_occupancy_count", lambda _chatgpt: 3)
     monkeypatch.setattr(manager, "_count_pool_active_accounts", lambda *args, **kwargs: 2)
     monkeypatch.setattr(manager, "get_standby_accounts", lambda: [])
     monkeypatch.setattr(
@@ -101,6 +187,97 @@ def test_cmd_rotate_can_defer_final_sync_when_running_as_api_task(monkeypatch):
         ("cmd_check", None),
         ("schedule_post_sync", "[轮转]"),
     ]
+
+
+def test_prepare_remote_capacity_counts_pending_invites(monkeypatch):
+    class FakeApi:
+        def __init__(self):
+            self.browser = True
+            self.deleted = []
+            self.invite_present = True
+
+        def start(self):
+            self.browser = True
+
+        def _api_fetch(self, method, path, body=None):
+            if method == "GET" and path.endswith("/users"):
+                return {
+                    "status": 200,
+                    "body": json.dumps(
+                        {
+                            "items": [
+                                {"id": "owner", "email": "owner@example.com", "role": "account-owner"},
+                                {"id": "u1", "email": None, "role": "standard-user"},
+                            ]
+                        }
+                    ),
+                }
+            if method == "GET" and path.endswith("/invites"):
+                items = [{"id": "inv1", "email_address": "pending@yunfei.life"}] if self.invite_present else []
+                return {
+                    "status": 200,
+                    "body": json.dumps({"items": items}),
+                }
+            if method == "DELETE" and "/invites/" in path:
+                self.deleted.append(path.rsplit("/", 1)[-1])
+                self.invite_present = False
+                return {"status": 204, "body": ""}
+            return {"status": 404, "body": "{}"}
+
+    fake = FakeApi()
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(manager, "_configured_mail_domains", lambda: {"yunfei.life"})
+    monkeypatch.setattr(manager, "_find_team_auth_file", lambda _email: None)
+    monkeypatch.setattr(manager, "load_accounts", lambda: [])
+
+    assert manager._prepare_remote_capacity_for_new_seat(fake) is True
+    assert fake.deleted == ["inv1"]
+
+
+def test_invite_to_team_refuses_when_pending_invite_still_occupies_capacity(monkeypatch):
+    class FakeApi:
+        def __init__(self):
+            self.browser = True
+            self.invite_calls = []
+
+        def start(self):
+            self.browser = True
+
+        def _api_fetch(self, method, path, body=None):
+            if method == "GET" and path.endswith("/users"):
+                return {
+                    "status": 200,
+                    "body": json.dumps(
+                        {
+                            "items": [
+                                {"id": "owner", "email": "owner@example.com", "role": "account-owner"},
+                                {"id": "u1", "email": None, "role": "standard-user"},
+                            ]
+                        }
+                    ),
+                }
+            if method == "GET" and path.endswith("/invites"):
+                return {
+                    "status": 200,
+                    "body": json.dumps({"items": [{"id": "inv1", "email_address": "manual@example.com"}]}),
+                }
+            return {"status": 404, "body": "{}"}
+
+        def invite_member(self, email, seat_type="default"):
+            self.invite_calls.append((email, seat_type))
+            return 200, {}
+
+    fake = FakeApi()
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(manager, "_configured_mail_domains", lambda: {"yunfei.life"})
+    monkeypatch.setattr(manager, "load_accounts", lambda: [])
+
+    assert manager.invite_to_team(fake, "yun13@yunfei.life") is False
+    assert fake.invite_calls == []
 
 
 def test_replaceable_pool_blocker_reason_reports_concrete_evidence(tmp_path):
@@ -253,12 +430,15 @@ def test_cmd_rotate_removes_replaceable_blocker_before_creating_replacement(monk
     events = []
 
     monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", True)
+    monkeypatch.setattr(config, "ROTATE_ALLOW_NEW_ACCOUNTS", True)
     monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
     monkeypatch.setattr(manager, "cmd_check", lambda: events.append(("cmd_check", None)))
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", lambda: accounts)
-    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(counts))
+    monkeypatch.setattr(manager, "get_team_occupancy_count", lambda _chatgpt: next(counts))
+    monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_a, **_kw: True)
+    monkeypatch.setattr(manager, "_wait_for_remote_capacity_after_removal", lambda *_a, **_kw: (2, True))
     monkeypatch.setattr(manager, "get_standby_accounts", lambda: [])
     monkeypatch.setattr(manager, "time", manager.time)
     monkeypatch.setattr(manager.time, "sleep", lambda *_args, **_kwargs: None)
@@ -371,7 +551,8 @@ def test_cmd_rotate_target2_refills_after_exhausted_removal_despite_transient_ov
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", fake_load_accounts)
     monkeypatch.setattr(manager, "update_account", fake_update)
-    monkeypatch.setattr(manager, "get_team_member_count", fake_count)
+    monkeypatch.setattr(manager, "get_team_occupancy_count", fake_count)
+    monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_a, **_kw: True)
     monkeypatch.setattr(manager, "_wait_for_remote_capacity_after_removal", fake_wait)
     monkeypatch.setattr(
         manager,

@@ -67,6 +67,10 @@ def test_cloudflare_temp_email_top_level_compat_uses_provider(monkeypatch):
         cloudflare_temp_email.normalize_cloudflare_temp_email_base_url("https://mail.example.com/admin/")
         == "https://mail.example.com"
     )
+    assert (
+        cloudflare_temp_email.normalize_cloudflare_temp_email_base_url("https://mail.example.com/api")
+        == "https://mail.example.com"
+    )
 
     client = cloudflare_temp_email.CloudflareTempEmailClient()
     monkeypatch.setattr(client, "domain", "example.com")
@@ -201,6 +205,54 @@ def test_extract_verification_code_uses_plain_text_when_available():
     }
 
     assert client.extract_verification_code(email_data) == "123456"
+
+
+def test_extract_verification_code_prefers_context_when_multiple_numbers():
+    client = cf_temp_email.CfTempEmailClient()
+
+    email_data = {
+        "text": (
+            "Request 381245 was created at 202606. "
+            "Your ChatGPT code is 654321. "
+            "This code expires in 10 minutes."
+        ),
+        "subject": "OpenAI login 111111",
+    }
+
+    assert client.extract_verification_code(email_data) == "654321"
+
+
+def test_extract_verification_code_supports_trailing_context():
+    client = cf_temp_email.CfTempEmailClient()
+
+    email_data = {
+        "text": "837462 is your OpenAI verification code. Do not share it.",
+        "content": "<a href=\"https://example.com/t/123456\">ignore</a>",
+    }
+
+    assert client.extract_verification_code(email_data) == "837462"
+
+
+def test_extract_verification_code_rejects_ambiguous_uncontextual_numbers():
+    client = cf_temp_email.CfTempEmailClient()
+
+    email_data = {
+        "text": "Ticket 123456. Link token 654321.",
+        "subject": "Notification",
+    }
+
+    assert client.extract_verification_code(email_data) is None
+
+
+def test_extract_verification_code_allows_single_standalone_visible_code():
+    client = cf_temp_email.CfTempEmailClient()
+
+    email_data = {
+        "text": "Use 246810 to continue.",
+        "subject": "OpenAI",
+    }
+
+    assert client.extract_verification_code(email_data) == "246810"
 
 
 def test_factory_returns_cf_temp_email_by_default(monkeypatch):

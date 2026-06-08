@@ -44,6 +44,7 @@ export const api = {
   saveSetup: (config) => request('POST', '/setup/save', config),
   // SPEC-1 §4.2 — 三步分阶段 mail provider 探测
   probeMailProvider: (payload) => request('POST', '/mail-provider/probe', payload),
+  getMailInbox: (address, limit = 10) => request('GET', `/mail/inbox?address=${encodeURIComponent(address)}&limit=${limit}`),
 
   getStatus: () => request('GET', '/status'),
   getAdminStatus: () => request('GET', '/admin/status'),

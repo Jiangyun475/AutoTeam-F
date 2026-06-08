@@ -45,7 +45,7 @@ def test_infer_mail_provider_from_email_uses_matching_domain(monkeypatch):
     assert mail_module.infer_mail_provider_from_email("user@unknown.example.com") == ""
 
 
-def test_sync_to_cpa_skips_disabled_accounts_and_keeps_protected_remote(monkeypatch, tmp_path):
+def test_sync_to_cpa_skips_disabled_accounts_and_keeps_remote_when_active_pool_is_short(monkeypatch, tmp_path):
     enabled_auth = tmp_path / "codex-enabled@example.com-team-a.json"
     disabled_auth = tmp_path / "codex-disabled@example.com-team-b.json"
     enabled_auth.write_text('{"access_token":"token-enabled"}', encoding="utf-8")
@@ -211,7 +211,67 @@ def test_sync_to_cpa_allows_remote_delete_when_active_pool_is_stable(monkeypatch
     assert result["delete_guard"]["skipped_remote_delete"] == 0
 
 
-def test_sync_to_cpa_preserves_credential_seat_when_remote_delete_is_allowed(monkeypatch, tmp_path):
+def test_sync_to_cpa_deletes_main_and_personal_credentials(monkeypatch, tmp_path):
+    first_auth = tmp_path / "codex-first@example.com-team-a.json"
+    second_auth = tmp_path / "codex-second@example.com-team-b.json"
+    personal_auth = tmp_path / "codex-personal@example.com-free-c.json"
+    main_auth = tmp_path / "codex-main-owner.json"
+    first_auth.write_text('{"access_token":"token-first"}', encoding="utf-8")
+    second_auth.write_text('{"access_token":"token-second"}', encoding="utf-8")
+    personal_auth.write_text('{"access_token":"token-personal"}', encoding="utf-8")
+    main_auth.write_text('{"access_token":"token-main"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {
+                "email": "first@example.com",
+                "status": "active",
+                "auth_file": str(first_auth),
+                "disabled": False,
+            },
+            {
+                "email": "second@example.com",
+                "status": "active",
+                "auth_file": str(second_auth),
+                "disabled": False,
+            },
+            {
+                "email": "personal@example.com",
+                "status": "personal",
+                "auth_file": str(personal_auth),
+                "disabled": False,
+            },
+        ],
+    )
+    monkeypatch.setattr("autoteam.accounts.save_accounts", lambda _accounts: None)
+    monkeypatch.setattr(cpa_sync, "_cleanup_local_duplicates", lambda _accounts: (0, False))
+    monkeypatch.setattr(
+        cpa_sync,
+        "list_cpa_files",
+        lambda: [
+            {"name": first_auth.name, "email": "first@example.com"},
+            {"name": second_auth.name, "email": "second@example.com"},
+            {"name": personal_auth.name, "email": "personal@example.com"},
+            {"name": main_auth.name, "email": ""},
+        ],
+    )
+
+    uploaded = []
+    deleted = []
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", lambda *_args, **_kwargs: ("ok", {}))
+    monkeypatch.setattr(cpa_sync, "upload_to_cpa", lambda path: uploaded.append(Path(path).name) or True)
+    monkeypatch.setattr(cpa_sync, "delete_from_cpa", lambda name: deleted.append(name) or True)
+
+    result = cpa_sync.sync_to_cpa()
+
+    assert uploaded == [first_auth.name, second_auth.name]
+    assert deleted == [personal_auth.name, main_auth.name]
+    assert result["synced_active"] == 2
+    assert result["synced_personal"] == 0
+
+
+def test_sync_to_cpa_deletes_non_active_credentials_when_remote_delete_is_allowed(monkeypatch, tmp_path):
     active_auth = tmp_path / "codex-active@example.com-team-a.json"
     second_active_auth = tmp_path / "codex-second-active@example.com-team-c.json"
     protected_auth = tmp_path / "codex-protected@example.com-team-b.json"
@@ -272,9 +332,9 @@ def test_sync_to_cpa_preserves_credential_seat_when_remote_delete_is_allowed(mon
     result = cpa_sync.sync_to_cpa()
 
     assert uploaded == [active_auth.name, second_active_auth.name]
-    assert deleted == []
+    assert deleted == [protected_auth.name]
     assert result["delete_guard"]["allow_remote_delete"] is True
-    assert result["delete_guard"]["skipped_protected"] == 1
+    assert result["delete_guard"]["skipped_protected"] == 0
 
 
 def test_sync_to_cpa_skips_exhausted_active_credential_before_upload(monkeypatch, tmp_path):

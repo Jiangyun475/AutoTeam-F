@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 SYNC_TARGET_CPA = "cpa"
 SYNC_TARGET_SUB2API = "sub2api"
+SYNC_TARGET_LOCAL_CODEX = "local_codex"
 
 _SYNC_TARGET_META = {
     SYNC_TARGET_CPA: {
@@ -25,13 +26,18 @@ _SYNC_TARGET_META = {
         "toggle_key": "SYNC_TARGET_SUB2API",
         "config_keys": ("SUB2API_URL", "SUB2API_EMAIL", "SUB2API_PASSWORD"),
     },
+    SYNC_TARGET_LOCAL_CODEX: {
+        "label": "本机 Codex CLI",
+        "toggle_key": "SYNC_TARGET_LOCAL_CODEX",
+        "config_keys": (),
+    },
 }
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 
 
 def _normalize_env(env: Mapping[str, object] | None = None) -> dict[str, str]:
-    source = env or os.environ
+    source = os.environ if env is None else env
     return {str(key): "" if value is None else str(value) for key, value in source.items()}
 
 
@@ -60,6 +66,8 @@ def get_sync_target_states(env: Mapping[str, object] | None = None) -> dict[str,
         raw_toggle = (values.get(toggle_key) or "").strip()
         if raw_toggle:
             states[target] = parse_bool_env(raw_toggle)
+        elif not config_keys:
+            states[target] = False
         else:
             states[target] = all((values.get(key) or "").strip() for key in config_keys)
     return states
@@ -137,6 +145,15 @@ def sync_to_configured_targets():
             logger.warning("[Sync] Sub2API 同步失败，保留本地轮换结果: %s", exc)
             results[SYNC_TARGET_SUB2API] = {"ok": False, "error": str(exc)}
 
+    if SYNC_TARGET_LOCAL_CODEX in enabled_targets:
+        from autoteam.local_codex_sync import sync_best_active_to_local_codex
+
+        try:
+            results[SYNC_TARGET_LOCAL_CODEX] = sync_best_active_to_local_codex()
+        except Exception as exc:
+            logger.warning("[Sync] 本机 Codex CLI 同步失败，保留本地轮换结果: %s", exc)
+            results[SYNC_TARGET_LOCAL_CODEX] = {"ok": False, "error": str(exc)}
+
     return results
 
 
@@ -205,6 +222,15 @@ def sync_account_to_configured_targets(email: str, filepath: str):
         except Exception as exc:
             logger.warning("[Sync] Sub2API 新凭证即时同步失败，保留本地结果: %s", exc)
             results[SYNC_TARGET_SUB2API] = {"ok": False, "error": str(exc), "uploaded": auth_path.name}
+
+    if SYNC_TARGET_LOCAL_CODEX in enabled_targets:
+        from autoteam.local_codex_sync import sync_account_to_local_codex
+
+        try:
+            results[SYNC_TARGET_LOCAL_CODEX] = sync_account_to_local_codex(normalized_email, str(auth_path))
+        except Exception as exc:
+            logger.warning("[Sync] 本机 Codex CLI 新凭证即时同步失败，保留本地结果: %s", exc)
+            results[SYNC_TARGET_LOCAL_CODEX] = {"ok": False, "error": str(exc), "uploaded": auth_path.name}
 
     if not results:
         logger.info("[Sync] 未启用远端同步目标，跳过新凭证即时同步: %s", normalized_email)

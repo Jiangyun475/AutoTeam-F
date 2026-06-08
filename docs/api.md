@@ -218,7 +218,7 @@ Authorization: Bearer <API_KEY>
 {
   "provider": "cf_temp_email | maillab",
   "step": "fingerprint | credentials | domain_ownership",
-  "base_url": "https://example.com/api",
+  "base_url": "https://example.com",
   "username": "admin@example.com",     // 仅 maillab credentials/domain_ownership
   "password": "...",                   // 仅 maillab credentials/domain_ownership
   "admin_password": "...",             // 仅 cf_temp_email credentials/domain_ownership
@@ -283,10 +283,10 @@ cf_temp_email:
 ```bash
 curl -X POST http://localhost:8787/api/mail-provider/probe \
   -H "Content-Type: application/json" \
-  -d '{"provider":"cf_temp_email","step":"credentials","base_url":"https://mail.example.com/api","admin_password":"..."}'
+  -d '{"provider":"cf_temp_email","step":"credentials","base_url":"https://mail.example.com","admin_password":"..."}'
 ```
 
-> `cf_temp_email` 的 `base_url` 对应 `CLOUDMAIL_BASE_URL`，必须包含 `/api` 前缀；不要只填域名根路径。
+> `cf_temp_email` 的 `base_url` 对应 `CLOUDMAIL_BASE_URL`，填写 Worker 根地址即可；不要追加 `/api`。
 
 maillab:
 

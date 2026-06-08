@@ -71,6 +71,9 @@
         <OAuthPage v-else-if="currentPage === 'oauth'" key="oauth"
           :manual-account-status="manualAccountStatus" @refresh="onActionRefresh" @progress="onAdminProgress" />
 
+        <MailInboxPage v-else-if="currentPage === 'mail'" key="mail"
+          :status="status" />
+
         <TaskHistoryPage v-else-if="currentPage === 'tasks'" key="tasks"
           :tasks="tasks" />
 
@@ -100,6 +103,7 @@ import SyncPage from './components/SyncPage.vue'
 import TaskHistoryPage from './components/TaskHistoryPage.vue'
 import LogViewer from './components/LogViewer.vue'
 import OAuthPage from './components/OAuthPage.vue'
+import MailInboxPage from './components/MailInboxPage.vue'
 import Settings from './components/Settings.vue'
 import ToastHost from './components/ToastHost.vue'
 import AtButton from './components/AtButton.vue'

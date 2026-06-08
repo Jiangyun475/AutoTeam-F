@@ -572,12 +572,23 @@ def apply_pool_health_signal(
             from autoteam.workspace_pool import default_pool as pool_obj
             pool = pool_obj
         active = pool.get_active()
+        recovered_active = False
+        if active is None:
+            account_id = str((evidence or {}).get("account_id") or "").strip()
+            if account_id:
+                for row in pool.list_all():
+                    if str(row.get("account_id") or "").strip() == account_id:
+                        active = row
+                        recovered_active = True
+                        break
         if active is None:
             return None
         ws_id = active.get("id")
         if not ws_id:
             return None
         if healthy and reason in ("active", "subscription_grace"):
+            if recovered_active:
+                pool.set_active(ws_id)
             return pool.mark_healthy(ws_id)
         if (not healthy) and reason in _HARD_FAIL_REASONS:
             return pool.mark_unhealthy(ws_id, reason)

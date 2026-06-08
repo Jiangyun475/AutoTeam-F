@@ -44,10 +44,10 @@
         <input
           v-model="form[baseUrlKey]"
           type="text"
-          :placeholder="form.MAIL_PROVIDER === 'maillab' ? 'https://your-maillab.example.com' : 'https://example.com/api'"
+          :placeholder="form.MAIL_PROVIDER === 'maillab' ? 'https://your-maillab.example.com' : 'https://example.com'"
           class="w-full px-2 py-1.5 bg-surface border border-hairline rounded text-sm text-ink-950 focus-ring" />
         <p v-if="form.MAIL_PROVIDER !== 'maillab'" class="text-[11px] leading-relaxed text-ink-500">
-          cf_temp_email 的 CLOUDMAIL_BASE_URL 必须填写到 API 前缀，例如 https://your-domain.com/api。
+          cf_temp_email 的 CLOUDMAIL_BASE_URL 填 Worker 根地址，例如 https://your-domain.com，不要追加 /api。
         </p>
         <input
           v-if="form.MAIL_PROVIDER === 'maillab'"
@@ -148,10 +148,10 @@ const canTestConnection = computed(() => {
   return baseOk && pwdOk
 })
 
-const cloudmailBaseUrlMissingApi = computed(() => {
+const cloudmailBaseUrlHasApiSuffix = computed(() => {
   if (form.value.MAIL_PROVIDER === 'maillab') return false
   const value = String(form.value[baseUrlKey.value] || '').trim().replace(/\/+$/, '')
-  return !!value && !value.endsWith('/api')
+  return !!value && value.endsWith('/api')
 })
 
 const canEnterDomain = computed(() => state.value === 'DOMAIN' || state.value === 'SAVE')
@@ -201,11 +201,11 @@ function selectProvider(value) {
 async function testConnection() {
   testing.value = true
   try {
-    if (cloudmailBaseUrlMissingApi.value) {
+    if (cloudmailBaseUrlHasApiSuffix.value) {
       emit('error', {
         error_code: 'ROUTE_NOT_FOUND',
-        message: 'CLOUDMAIL_BASE_URL 需要包含 /api',
-        hint: '请填写类似 https://your-domain.com/api 的地址，而不是只填域名根路径。',
+        message: 'CLOUDMAIL_BASE_URL 不要追加 /api',
+        hint: '请填写类似 https://your-domain.com 的 Worker 根地址。',
       })
       return
     }

@@ -1,4 +1,6 @@
 from autoteam import manager
+import types
+import sys
 
 
 class _FakeStartedChatGPT:
@@ -67,6 +69,57 @@ def test_sync_account_states_recovers_team_auth_file_as_protected(tmp_path, monk
     assert saved[0]["auth_file"] == str(auth_file)
     assert saved[0]["workspace_account_id"] == "acc-1"
     assert saved[0]["protect_team_seat"] is True
+
+
+def test_sync_account_states_ignores_null_member_email(tmp_path, monkeypatch):
+    auth_dir = tmp_path / "auths"
+    auth_dir.mkdir()
+    saved = []
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acc-1")
+    monkeypatch.setattr(manager, "load_accounts", lambda: [])
+    monkeypatch.setattr(manager, "save_accounts", lambda accounts: saved.extend(accounts))
+    monkeypatch.setattr("autoteam.codex_auth.AUTH_DIR", auth_dir)
+
+    chatgpt = _FakeStartedChatGPT([{"email": None, "user_id": "u-null"}])
+    manager.sync_account_states(chatgpt_api=chatgpt)
+
+    assert saved == []
+
+
+def test_sync_account_states_keeps_active_team_auth_when_member_email_hidden(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-member@example.com-team.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    empty_auth_dir = tmp_path / "empty-auths"
+    empty_auth_dir.mkdir()
+    stored = [
+        {
+            "email": "member@example.com",
+            "status": "active",
+            "auth_file": str(auth_file),
+            "workspace_account_id": "acc-1",
+            "disabled": False,
+        }
+    ]
+    updates = []
+    saved = []
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acc-1")
+    monkeypatch.setattr(manager, "load_accounts", lambda: [dict(item) for item in stored])
+    monkeypatch.setattr(manager, "save_accounts", lambda accounts: saved.extend(accounts))
+    monkeypatch.setattr(manager, "update_account", lambda email, **fields: updates.append((email, fields)))
+    monkeypatch.setattr("autoteam.codex_auth.AUTH_DIR", empty_auth_dir)
+    monkeypatch.setitem(
+        sys.modules,
+        "autoteam.master_health",
+        types.SimpleNamespace(_apply_master_degraded_classification=lambda: {}),
+    )
+
+    chatgpt = _FakeStartedChatGPT([{"email": None, "role": "standard-user", "user_id": "u-hidden"}])
+    manager.sync_account_states(chatgpt_api=chatgpt)
+
+    assert updates == []
+    assert saved == []
 
 
 def test_sync_account_states_protects_existing_standby_auth_file(tmp_path, monkeypatch):

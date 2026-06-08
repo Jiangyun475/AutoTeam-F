@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -1235,12 +1236,121 @@ def _display_account_status(acc: dict, quota_snapshot: dict | None = None) -> st
     return "active" if _resolve_status_auth_file(acc) else status
 
 
+def _quota_int(quota_info: dict | None, key: str) -> int | None:
+    if not isinstance(quota_info, dict):
+        return None
+    value = quota_info.get(key)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _quota_ts(quota_info: dict | None, key: str) -> float | None:
+    if not isinstance(quota_info, dict):
+        return None
+    value = quota_info.get(key)
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dict:
+    raw_status = str(acc.get("status") or "")
+    now = time.time()
+    quota_info = quota_snapshot if isinstance(quota_snapshot, dict) else acc.get("last_quota")
+    primary_pct = _quota_int(quota_info, "primary_pct")
+    weekly_pct = _quota_int(quota_info, "weekly_pct")
+    primary_resets_at = _quota_ts(quota_info, "primary_resets_at")
+    weekly_resets_at = _quota_ts(quota_info, "weekly_resets_at")
+    quota_resets_at = acc.get("quota_resets_at")
+    if not isinstance(quota_resets_at, (int, float)) or quota_resets_at <= 0:
+        quota_resets_at = None
+    auth_retry_after = acc.get("auth_retry_after")
+    if not isinstance(auth_retry_after, (int, float)) or auth_retry_after <= 0:
+        auth_retry_after = None
+
+    next_usable_at = None
+    reason = "unknown"
+    bucket = 60
+
+    if _is_main_account_email(acc.get("email")):
+        bucket = 0
+        reason = "main_account"
+    elif acc.get("disabled"):
+        bucket = 90
+        reason = "disabled"
+    elif raw_status == "active":
+        bucket = 10
+        next_usable_at = primary_resets_at
+        reason = "active_5h_reset"
+    elif raw_status in ("standby", "exhausted"):
+        if auth_retry_after and auth_retry_after > now:
+            bucket = 45
+            next_usable_at = auth_retry_after
+            reason = "auth_retry_after"
+        elif quota_resets_at and quota_resets_at > now:
+            bucket = 40
+            next_usable_at = quota_resets_at
+            reason = "quota_resets_at"
+        else:
+            bucket = 20
+            next_usable_at = None
+            reason = "ready_now"
+    elif raw_status == "personal":
+        bucket = 30
+        next_usable_at = primary_resets_at
+        reason = "personal"
+    elif raw_status in ("pending", "auth_invalid", "orphan"):
+        bucket = 70
+        if auth_retry_after and auth_retry_after > now:
+            next_usable_at = auth_retry_after
+            reason = "auth_retry_after"
+        else:
+            reason = raw_status
+
+    return {
+        "pool_sort_bucket": bucket,
+        "next_usable_at": next_usable_at,
+        "next_usable_reason": reason,
+        "primary_pct": primary_pct,
+        "weekly_pct": weekly_pct,
+        "primary_resets_at": primary_resets_at,
+        "weekly_resets_at": weekly_resets_at,
+    }
+
+
+def _account_pool_sort_key(acc: dict) -> tuple:
+    schedule = acc.get("pool_schedule") or {}
+    bucket = schedule.get("pool_sort_bucket")
+    if not isinstance(bucket, (int, float)):
+        bucket = 60
+    next_usable_at = schedule.get("next_usable_at")
+    if not isinstance(next_usable_at, (int, float)):
+        next_usable_at = 0 if bucket in (0, 10, 20, 30) else 9999999999
+    primary_pct = schedule.get("primary_pct")
+    if not isinstance(primary_pct, (int, float)):
+        primary_pct = 999
+    created_at = acc.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        created_at = 0
+    return (int(bucket), float(next_usable_at), int(primary_pct), float(created_at), str(acc.get("email") or ""))
+
+
 def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
-    sanitized = {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
+    sanitized = {
+        k: v
+        for k, v in acc.items()
+        if k not in ("password", "cloudmail_account_id") and not str(k).startswith("_")
+    }
     sanitized["is_main_account"] = _is_main_account_email(acc.get("email"))
     sanitized["raw_status"] = acc.get("status", "")
     sanitized["status"] = _display_account_status(acc, quota_snapshot)
+    schedule = _account_pool_schedule(acc, quota_snapshot)
+    sanitized["pool_schedule"] = schedule
+    sanitized["pool_sort_bucket"] = schedule["pool_sort_bucket"]
+    sanitized["next_usable_at"] = schedule["next_usable_at"]
+    sanitized["next_usable_reason"] = schedule["next_usable_reason"]
     return sanitized
 
 
@@ -2246,7 +2356,9 @@ def get_accounts():
     from autoteam.accounts import load_accounts
 
     accounts = load_accounts()
-    return [_sanitize_account(a) for a in accounts]
+    sanitized = [_sanitize_account(a) for a in accounts]
+    sanitized.sort(key=_account_pool_sort_key)
+    return sanitized
 
 
 @app.get("/api/accounts/{email}/codex-auth")
@@ -2297,7 +2409,9 @@ def get_active():
     """获取活跃账号"""
     from autoteam.accounts import get_active_accounts
 
-    return [_sanitize_account(a) for a in get_active_accounts()]
+    sanitized = [_sanitize_account(a) for a in get_active_accounts()]
+    sanitized.sort(key=_account_pool_sort_key)
+    return sanitized
 
 
 @app.get("/api/accounts/standby")
@@ -2306,7 +2420,9 @@ def get_standby():
     from autoteam.accounts import get_standby_accounts
 
     accounts = get_standby_accounts()
-    return [_sanitize_account(a) for a in accounts]
+    sanitized = [_sanitize_account(a) for a in accounts]
+    sanitized.sort(key=_account_pool_sort_key)
+    return sanitized
 
 
 def _toggle_account_disabled(email: str, disabled: bool):
@@ -2994,6 +3110,7 @@ def get_status(fast: bool = False):
                 pass
 
     sanitized_accounts = [_sanitize_account(a, quota_cache.get(a.get("email"))) for a in accounts]
+    sanitized_accounts.sort(key=_account_pool_sort_key)
 
     summary = {
         "active": sum(1 for a in sanitized_accounts if a["status"] == STATUS_ACTIVE),
@@ -3054,6 +3171,92 @@ def get_register_failures_api(limit: int = 50):
         "items": list_failures(limit=max(1, min(limit, 500))),
         "counts": count_by_category(),
     }
+
+
+def _extract_mail_codes(*parts: str) -> list[str]:
+    text = "\n".join(str(part or "") for part in parts)
+
+    # The inbox UI should show only the most trustworthy OTP for a message.
+    # Returning every six-digit token makes HTML footers, dates and tracking
+    # snippets look like multiple verification codes.
+    contextual_patterns = [
+        r"(?is)(?:temporary\s+)?(?:openai|chatgpt)\s+(?:login\s+)?code(?:\s+is)?\D{0,80}(\d{6})",
+        r"(?is)(?:verification|login|security|one[-\s]?time|auth(?:entication)?)\s+code(?:\s+is)?\D{0,80}(\d{6})",
+        r"(?is)(?:验证码|一次性代码|登录代码|安全代码|代码)(?:\s*(?:为|是|:|：))?\D{0,40}(\d{6})",
+        r"(?is)\b(\d{6})\b\D{0,60}(?:is\s+your|your)\s+(?:temporary\s+)?(?:openai|chatgpt)?\s*(?:login|verification|security|one[-\s]?time)?\s*code\b",
+    ]
+    for pattern in contextual_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return [match.group(1)]
+
+    candidates: list[str] = []
+    for match in re.findall(r"(?<!\d)(\d{6})(?!\d)", text):
+        if match not in candidates:
+            candidates.append(match)
+    return candidates if len(candidates) == 1 else []
+
+
+@app.get("/api/mail/inbox")
+def get_mail_inbox(address: str, limit: int = 10):
+    """Read recent messages for a configured temporary-mail address."""
+    normalized = (address or "").strip().lower()
+    if not normalized or "@" not in normalized:
+        raise HTTPException(status_code=400, detail="请填写有效邮箱地址")
+    safe_limit = max(1, min(50, int(limit or 10)))
+
+    try:
+        from autoteam.mail import get_mail_client
+
+        client = get_mail_client()
+        login = getattr(client, "login", None)
+        if callable(login):
+            login()
+        search = getattr(client, "search_emails_by_recipient", None)
+        if not callable(search):
+            raise RuntimeError("当前邮箱后端不支持按收件人查询邮件")
+        mails = search(normalized, size=safe_limit)
+    except Exception as exc:
+        logger.exception("[MailInbox] 查询 %s 失败", normalized)
+        raise HTTPException(status_code=400, detail=f"查询邮件失败: {exc}") from exc
+
+    from autoteam.mail.base import html_to_visible_text
+
+    items = []
+    for mail in mails or []:
+        subject = mail.get("subject") or ""
+        text = mail.get("text") or ""
+        content = mail.get("content") or ""
+        raw = mail.get("raw") or ""
+        code = None
+        extractor = getattr(client, "extract_verification_code", None)
+        if callable(extractor):
+            try:
+                code = extractor(mail)
+            except Exception as exc:
+                logger.debug("[MailInbox] 统一验证码提取失败,回退正则: %s", exc)
+        codes = [code] if code else _extract_mail_codes(subject, text, content)
+        if not codes:
+            codes = _extract_mail_codes(raw)
+        body = text or html_to_visible_text(content) or raw or ""
+        body_truncated = len(body) > 20000
+        if body_truncated:
+            body = body[:20000]
+        items.append(
+            {
+                "id": mail.get("emailId") or mail.get("id"),
+                "created_at": mail.get("createTime") or mail.get("created_at"),
+                "from": mail.get("sendEmail") or mail.get("sender") or mail.get("source"),
+                "to": mail.get("receiveEmail") or mail.get("accountEmail") or normalized,
+                "subject": subject,
+                "codes": codes,
+                "body": body,
+                "body_truncated": body_truncated,
+                "preview": body[:600],
+            }
+        )
+
+    return {"address": normalized, "count": len(items), "items": items}
 
 
 @app.get("/api/config/register-domain")
@@ -3283,19 +3486,31 @@ def post_team_member_remove(params: TeamMemberRemoveParams):
         account_id = get_chatgpt_account_id()
 
         def _do_remove_team_member():
+            from autoteam.account_ops import delete_team_invite, fetch_team_state, team_invite_email
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
             chatgpt = ChatGPTTeamAPI()
             try:
                 chatgpt.start()
                 if member_type == "invite":
-                    path = f"/backend-api/accounts/{account_id}/invites/{user_id}"
+                    result = delete_team_invite(chatgpt, account_id, invite_id=user_id, email=email)
                     action_text = "取消邀请"
+                    if result.get("status") in (200, 204):
+                        deadline = time.time() + 20
+                        while time.time() < deadline:
+                            try:
+                                _members, invites = fetch_team_state(chatgpt)
+                                if not any(team_invite_email(inv) == email for inv in invites):
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(2)
+                        else:
+                            return {"status": 409, "body": "invite still present after delete"}, action_text
                 else:
                     path = f"/backend-api/accounts/{account_id}/users/{user_id}"
+                    result = chatgpt._api_fetch("DELETE", path)
                     action_text = "移出 Team"
-
-                result = chatgpt._api_fetch("DELETE", path)
                 return result, action_text
             finally:
                 chatgpt.stop()

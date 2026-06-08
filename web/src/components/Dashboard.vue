@@ -31,7 +31,7 @@
         <div>
           <h2 class="text-base font-bold text-ink-950 tracking-tight">账号列表</h2>
           <p class="text-[11px] text-ink-500 mt-0.5">
-            {{ totalAccounts }} 个账号 · 每页 {{ ACCOUNT_PAGE_SIZE }} 条 · 实时配额来自 quota_cache
+            {{ totalAccounts }} 个账号 · 每页 {{ ACCOUNT_PAGE_SIZE }} 条 · 排序: 使用中 → 可复用 → 等刷新 → 异常 → 禁用
           </p>
         </div>
         <div class="flex items-center gap-2">
@@ -119,6 +119,7 @@
               <th class="px-4 py-3 font-semibold text-right">5h 剩余</th>
               <th class="px-4 py-3 font-semibold text-right">周 剩余</th>
               <th class="px-4 py-3 font-semibold">5h 重置</th>
+              <th class="px-4 py-3 font-semibold">下次可用</th>
               <th class="px-4 py-3 font-semibold">周 重置</th>
               <th class="px-4 py-3 font-semibold text-right">操作</th>
             </tr>
@@ -159,6 +160,10 @@
                 {{ quotaPct(acc, 'weekly') }}
               </td>
               <td class="px-4 py-3.5 text-ink-500 font-mono text-[11px]">{{ quotaReset(acc, 'primary') }}</td>
+              <td class="px-4 py-3.5">
+                <div class="font-mono text-[11px] text-ink-700">{{ nextUsableText(acc) }}</div>
+                <div class="text-[10px] text-ink-400 mt-0.5">{{ nextUsableReason(acc) }}</div>
+              </td>
               <td class="px-4 py-3.5 text-ink-500 font-mono text-[11px]">{{ quotaReset(acc, 'weekly') }}</td>
               <td class="px-4 py-3.5 text-right">
                 <div class="flex items-center justify-end gap-1.5 flex-wrap">
@@ -514,6 +519,34 @@ function quotaReset(acc, type) {
   return formatQuotaReset(qi, type)
 }
 function pctColor(remain) { return quotaPctColor(remain) }
+
+function formatPoolTime(ts) {
+  if (!ts) return '现在'
+  const d = new Date(ts * 1000)
+  const pad = n => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function nextUsableText(acc) {
+  if (acc.disabled) return '-'
+  return formatPoolTime(acc.next_usable_at)
+}
+
+function nextUsableReason(acc) {
+  const map = {
+    main_account: '母号',
+    active_5h_reset: '当前使用中',
+    ready_now: '已可复用',
+    quota_resets_at: '等额度刷新',
+    auth_retry_after: '等登录重试',
+    personal: '个人号',
+    disabled: '已禁用',
+    pending: '处理中',
+    auth_invalid: '认证异常',
+    orphan: '席位异常',
+  }
+  return map[acc.next_usable_reason] || acc.next_usable_reason || '-'
+}
 
 const exportJson = computed(() => {
   if (!exportData.value) return ''

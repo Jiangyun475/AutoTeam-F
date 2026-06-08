@@ -739,6 +739,45 @@ def test_sanitize_account_masks_disabled_non_main_status(monkeypatch):
     assert sanitized["disabled"] is True
 
 
+def test_sanitize_account_exposes_next_usable_for_standby(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "standby@example.com",
+            "status": accounts.STATUS_STANDBY,
+            "quota_resets_at": 1_600,
+            "last_quota": {"primary_pct": 100, "primary_resets_at": 1_600},
+        }
+    )
+
+    assert sanitized["next_usable_at"] == 1_600
+    assert sanitized["next_usable_reason"] == "quota_resets_at"
+    assert sanitized["pool_sort_bucket"] == 40
+
+
+def test_account_pool_sort_orders_active_ready_waiting_and_disabled(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+
+    rows = [
+        api._sanitize_account({"email": "disabled@example.com", "status": accounts.STATUS_STANDBY, "disabled": True}),
+        api._sanitize_account({"email": "waiting@example.com", "status": accounts.STATUS_STANDBY, "quota_resets_at": 1_500}),
+        api._sanitize_account({"email": "active@example.com", "status": accounts.STATUS_ACTIVE, "last_quota": {"primary_pct": 5, "primary_resets_at": 2_000}}),
+        api._sanitize_account({"email": "ready@example.com", "status": accounts.STATUS_STANDBY, "quota_resets_at": 900}),
+    ]
+
+    rows.sort(key=api._account_pool_sort_key)
+
+    assert [row["email"] for row in rows] == [
+        "active@example.com",
+        "ready@example.com",
+        "waiting@example.com",
+        "disabled@example.com",
+    ]
+
+
 def test_post_rotate_runs_final_sync_in_background(monkeypatch):
     started = []
     rotate_calls = []
