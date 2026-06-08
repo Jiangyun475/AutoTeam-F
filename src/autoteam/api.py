@@ -27,6 +27,18 @@ from autoteam.textio import read_text
 logger = logging.getLogger(__name__)
 
 
+def _body_preview(value, limit: int = 500) -> str:
+    """Return a short, serializable preview for diagnostic responses."""
+    try:
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        text = repr(value)
+    return text[:limit]
+
+
 def _safe_runtime_resource_snapshot() -> dict:
     try:
         return collect_runtime_resource_snapshot()
@@ -1625,26 +1637,83 @@ def get_admin_diagnose():
 
         api = ChatGPTTeamAPI()
         try:
+            setup_steps = []
+
+            def _record_step(name: str, ok: bool, detail=None):
+                setup_steps.append({"step": name, "ok": ok, "detail": _body_preview(detail, 300)})
+
+            def _safe_wait_for_cloudflare(label: str) -> bool:
+                try:
+                    api._wait_for_cloudflare()
+                    _record_step(label, True)
+                    return True
+                except Exception as exc:
+                    logger.warning("[诊断] wait_for_cloudflare failed label=%s: %s", label, exc)
+                    _record_step(label, False, exc)
+                    return False
+
+            def _safe_page_fetch(path: str) -> dict:
+                script = (
+                    "async (path) => { const r = await fetch(path); "
+                    "return { status: r.status, body: (await r.text()).slice(0, 400) }; }"
+                )
+                last_error = None
+                for attempt in range(2):
+                    try:
+                        api.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    try:
+                        return api.page.evaluate(script, path)
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning(
+                            "[诊断] page fetch failed path=%s attempt=%d: %s",
+                            path,
+                            attempt + 1,
+                            exc,
+                        )
+                        try:
+                            api.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                            time.sleep(1)
+                        except Exception as nav_exc:
+                            last_error = nav_exc
+                            break
+                return {"status": None, "error": _body_preview(last_error, 400)}
+
+            def _safe_api_fetch(name: str, path: str) -> dict:
+                try:
+                    r = api._api_fetch("GET", path)
+                    return {"status": r.get("status"), "body": _body_preview(r.get("body") or "", 500)}
+                except Exception as exc:
+                    logger.warning("[诊断] api fetch failed name=%s path=%s: %s", name, path, exc)
+                    return {"status": None, "error": _body_preview(exc, 500)}
+
             api._launch_browser()
+            _record_step("launch_browser", True)
             api.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            _record_step("goto_chatgpt_initial", True)
             time.sleep(3)
-            api._wait_for_cloudflare()
+            _safe_wait_for_cloudflare("wait_cloudflare_initial")
             session_token = get_admin_session_token()
             if session_token:
                 api.account_id = get_chatgpt_account_id() or ""  # 让 _inject_session 把 _account cookie 带上
                 api._inject_session(session_token)
+                _record_step("inject_session", True)
                 api.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                _record_step("goto_chatgpt_after_inject", True)
                 time.sleep(2)
-                api._wait_for_cloudflare()
-            api._fetch_access_token()
+                _safe_wait_for_cloudflare("wait_cloudflare_after_inject")
+            try:
+                api._fetch_access_token()
+                _record_step("fetch_access_token", bool(api.access_token))
+            except Exception as exc:
+                logger.warning("[诊断] fetch_access_token failed: %s", exc)
+                _record_step("fetch_access_token", False, exc)
             account_id = api.account_id or get_chatgpt_account_id() or ""
             probes = {}
 
-            session_result = api.page.evaluate(
-                "async () => { const r = await fetch('/api/auth/session'); "
-                "return { status: r.status, body: (await r.text()).slice(0, 400) }; }"
-            )
-            probes["auth_session"] = session_result
+            probes["auth_session"] = _safe_page_fetch("/api/auth/session")
 
             for name, path in [
                 ("backend_me", "/backend-api/me"),
@@ -1652,8 +1721,7 @@ def get_admin_diagnose():
                 ("workspace_settings", f"/backend-api/accounts/{account_id}/settings"),
                 ("workspace_users", f"/backend-api/accounts/{account_id}/users"),
             ]:
-                r = api._api_fetch("GET", path)
-                probes[name] = {"status": r.get("status"), "body": (r.get("body") or "")[:500]}
+                probes[name] = _safe_api_fetch(name, path)
 
             # Round 8 — SPEC-2 v1.5 §6.2:diagnose 内嵌 master_subscription_state(read-only,5min cache)
             try:
@@ -1676,6 +1744,7 @@ def get_admin_diagnose():
                 "account_id": account_id,
                 "access_token_present": bool(api.access_token),
                 "access_token_prefix": (api.access_token or "")[:30],
+                "setup_steps": setup_steps,
                 "probes": probes,
                 "master_subscription_state": master_state,
             }
@@ -3381,14 +3450,16 @@ def post_sync_accounts():
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再同步"))
 
     try:
-        _pw_executor.run(sync_account_states)
+        result = _pw_executor.run(sync_account_states)
     finally:
         _playwright_lock.release()
+    if isinstance(result, dict) and result.get("ok") is False:
+        raise HTTPException(status_code=502, detail=result)
 
     from autoteam.accounts import load_accounts
 
     accounts = load_accounts()
-    return {"message": f"同步完成，共 {len(accounts)} 个账号", "total": len(accounts)}
+    return {"message": f"同步完成，共 {len(accounts)} 个账号", "total": len(accounts), "result": result}
 
 
 @app.get("/api/team/members")
@@ -3414,22 +3485,36 @@ def get_team_members():
             )
             from autoteam.accounts import load_accounts
             from autoteam.chatgpt_api import ChatGPTTeamAPI
+            from autoteam.manager import _chatgpt_user_id_for_email
 
             chatgpt = ChatGPTTeamAPI()
             try:
                 chatgpt.start()
                 members, invites = fetch_team_state(chatgpt)
-                local_emails = {a["email"].lower() for a in load_accounts()}
+                local_accounts = load_accounts()
+                local_emails = {a["email"].lower() for a in local_accounts}
+                local_by_user_id = {
+                    user_id: a
+                    for a in local_accounts
+                    for user_id in [_chatgpt_user_id_for_email(a.get("email"))]
+                    if user_id
+                }
 
                 result = []
                 for m in members:
                     email = team_member_email(m)
+                    user_id = team_member_user_id(m) or ""
+                    matched_email = ""
+                    if not email and user_id in local_by_user_id:
+                        matched_email = (local_by_user_id[user_id].get("email") or "").lower()
+                        email = matched_email
                     result.append(
                         {
                             "email": email,
                             "role": team_member_role(m) or "",
-                            "user_id": team_member_user_id(m) or "",
+                            "user_id": user_id,
                             "is_local": email in local_emails,
+                            "matched_by_user_id": bool(matched_email),
                             "type": "member",
                         }
                     )
@@ -3453,7 +3538,11 @@ def get_team_members():
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            logger.error("[Team成员] 查询失败: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "team_members_fetch_failed", "message": _body_preview(exc, 800)},
+            ) from exc
     finally:
         _playwright_lock.release()
 

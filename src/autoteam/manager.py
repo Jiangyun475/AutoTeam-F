@@ -1409,13 +1409,36 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
 
         accounts = load_accounts()
         by_email = {(a.get("email") or "").lower(): a for a in accounts}
+        by_user_id = {
+            user_id: a
+            for a in accounts
+            for user_id in [_chatgpt_user_id_for_email(a.get("email"))]
+            if user_id
+        }
 
         # 收集 Team 里非主号成员
         team_subs = []
         for m in members:
-            email = (m.get("email") or "").lower()
-            if not email or _is_main_account_email(email):
+            email = team_member_email(m)
+            role = (team_member_role(m) or "").strip().lower()
+            if role == "account-owner" or _is_main_account_email(email):
                 continue
+            if not email:
+                member_user_id = team_member_user_id(m)
+                matched_acc = by_user_id.get(str(member_user_id or ""))
+                if matched_acc:
+                    email = (matched_acc.get("email") or "").lower()
+                    logger.info(
+                        "[对账] Team 成员邮箱隐藏,通过 auth JWT user_id 精确命中 %s → user_id=%s",
+                        email,
+                        member_user_id,
+                    )
+                else:
+                    logger.warning(
+                        "[对账] Team 存在隐藏邮箱子号 user_id=%s,但本地没有匹配 auth JWT;不使用 name fallback",
+                        member_user_id or "<empty>",
+                    )
+                    continue
             team_subs.append((email, m))
 
         # 第一轮:按状态对账
@@ -1677,7 +1700,8 @@ def sync_account_states(chatgpt_api=None):
     """根据 Team 实际成员列表同步本地账号状态"""
     account_id = get_chatgpt_account_id()
     if not account_id:
-        return
+        logger.error("[同步] account_id 为空，无法同步 Team 成员状态")
+        return {"ok": False, "error": "missing_account_id"}
     accounts = load_accounts()
     team_emails = set()
 
@@ -1688,24 +1712,47 @@ def sync_account_states(chatgpt_api=None):
             chatgpt_api = ChatGPTTeamAPI()
             chatgpt_api.start()
             need_stop = True
-        except Exception:
+        except Exception as exc:
             # Playwright 不可用（event loop 冲突等），跳过同步
-            return
+            logger.error("[同步] 无法启动 ChatGPTTeamAPI: %s", exc)
+            return {"ok": False, "error": "chatgpt_api_start_failed", "detail": str(exc)}
 
     try:
         path = f"/backend-api/accounts/{account_id}/users"
         result = chatgpt_api._api_fetch("GET", path)
         if result["status"] != 200:
-            return
+            body_excerpt = (result.get("body") or "")[:500].replace("\n", " ")
+            logger.error(
+                "[同步] 获取 Team 成员失败: status=%s body=%s",
+                result.get("status"),
+                body_excerpt,
+            )
+            return {
+                "ok": False,
+                "error": "team_users_fetch_failed",
+                "status": result.get("status"),
+                "body_preview": body_excerpt,
+            }
 
         data = json.loads(result["body"])
         members = data.get("items", data.get("users", data.get("members", [])))
-        team_emails = {(m.get("email") or "").lower() for m in members}
+        team_emails = set()
+        team_user_ids = set()
+        for m in members:
+            email = team_member_email(m)
+            role = (team_member_role(m) or "").strip().lower()
+            if role == "account-owner" or _is_main_account_email(email):
+                continue
+            if email:
+                team_emails.add(email)
+            member_user_id = team_member_user_id(m)
+            if member_user_id:
+                team_user_ids.add(str(member_user_id))
         anonymous_team_sub_slots = sum(
             1
             for m in members
-            if not (m.get("email") or "").strip()
-            and (m.get("role") or "").strip().lower() != "account-owner"
+            if not team_member_email(m)
+            and (team_member_role(m) or "").strip().lower() != "account-owner"
         )
     finally:
         if need_stop:
@@ -1763,9 +1810,16 @@ def sync_account_states(chatgpt_api=None):
 
     for acc in accounts:
         email = acc["email"].lower()
-        in_team = email in team_emails
+        auth_user_id = _chatgpt_user_id_for_email(email)
+        in_team = email in team_emails or bool(auth_user_id and auth_user_id in team_user_ids)
 
         if in_team and acc["status"] in (STATUS_STANDBY, STATUS_PENDING, "auth_pending"):
+            if email not in team_emails and auth_user_id:
+                logger.info(
+                    "[同步] Team 成员邮箱隐藏,通过 auth JWT user_id 精确命中 %s → user_id=%s",
+                    acc["email"],
+                    auth_user_id,
+                )
             # Round 12 wire-up M1 — go through state machine (default_machine.transition).
             ws_id = account_id or None
             protect_team_seat = _has_auth_file(acc)
@@ -1927,8 +1981,9 @@ def sync_account_states(chatgpt_api=None):
                 email = auth_data.get("email", "").lower()
                 if not email or email in local_email_set or _is_main_account_email(email):
                     continue
-                # 判断是否在 Team 中
-                in_team = email in team_emails
+                # 判断是否在 Team 中。OpenAI 可能隐藏 member email,此时只能用 auth JWT user_id 匹配。
+                auth_user_id = _chatgpt_user_id_from_auth_data(auth_data)
+                in_team = email in team_emails or bool(auth_user_id and auth_user_id in team_user_ids)
                 status = STATUS_ACTIVE if in_team else STATUS_STANDBY
                 recovered = {
                     "email": email,
@@ -1970,6 +2025,8 @@ def sync_account_states(chatgpt_api=None):
             )
     except Exception as exc:
         logger.warning("[同步] retroactive helper 异常(不影响 sync 主流程): %s", exc)
+
+    return {"ok": True, "changed": changed, "total": len(accounts)}
 
 
 def _print_status_table(accounts, quota_cache=None):
@@ -3183,8 +3240,10 @@ def _can_cancel_pending_invite(email: str, acc: dict | None) -> tuple[bool, str]
         return False, "missing_email"
     if _is_main_account_email(email):
         return False, "main_account"
-    if acc and _has_auth_file(acc):
-        return False, "local_auth_protected"
+    if acc and _has_auth_file(acc) and acc.get("status") == STATUS_ACTIVE:
+        return False, "active_auth_protected"
+    if acc and acc.get("status") != STATUS_ACTIVE:
+        return True, "local_managed_pending_not_active"
     if _find_team_auth_file(email) is not None:
         return False, "auth_file_protected"
     if acc:
@@ -3206,6 +3265,47 @@ def _wait_for_pending_invite_absent(chatgpt_api, email: str, *, timeout: int = 3
             pass
         time.sleep(2)
     return False
+
+
+def _cancel_pending_invite_for_email(chatgpt_api, email: str, *, stage_label: str = "[Team]") -> bool:
+    """Cancel one pending invite by exact email and verify it disappears."""
+    target = _normalized_email(email)
+    if not target:
+        return False
+    if chatgpt_api is None:
+        logger.warning("%s 缺少 Team API session，无法取消 pending invite: %s", stage_label, target)
+        return False
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+
+    try:
+        _members, invites = fetch_team_state(chatgpt_api)
+    except Exception as exc:
+        logger.warning("%s 查询 pending invite 失败: %s (%s)", stage_label, target, exc)
+        return False
+
+    account_id = get_chatgpt_account_id()
+    for invite in invites:
+        if team_invite_email(invite) != target:
+            continue
+        invite_id = _pending_invite_id(invite)
+        result = delete_team_invite(chatgpt_api, account_id, invite, invite_id=invite_id, email=target)
+        if result.get("status") not in (200, 204):
+            logger.warning(
+                "%s 取消 pending invite 失败: %s HTTP %s",
+                stage_label,
+                target,
+                result.get("status"),
+            )
+            return False
+        if not _wait_for_pending_invite_absent(chatgpt_api, target):
+            logger.warning("%s pending invite 已提交取消但远端仍暂未消失: %s", stage_label, target)
+            return False
+        logger.info("%s 已取消 pending invite: %s", stage_label, target)
+        return True
+
+    logger.info("%s 未找到 pending invite: %s", stage_label, target)
+    return True
 
 
 def _cancel_stale_pending_invites_for_capacity(chatgpt_api, *, stage_label: str = "[Team]", mail_client=None) -> list[str]:
@@ -5923,6 +6023,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         invite_link = _wait_for_invite_link(mail_client, email)
         if not invite_link:
             logger.warning("[轮转] 旧账号未收到 Team 邀请邮件，保持 standby: %s", email)
+            _cancel_pending_invite_for_email(chatgpt_api, email, stage_label="[轮转]")
             update_account(email, status=STATUS_STANDBY)
             return False
 
@@ -5939,6 +6040,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         )
         if accepted_password is None:
             logger.warning("[轮转] 旧账号接受 Team 邀请失败，保持 standby: %s", email)
+            _cancel_pending_invite_for_email(chatgpt_api, email, stage_label="[轮转]")
             update_account(email, status=STATUS_STANDBY)
             return False
         if accepted_password != password:
@@ -6798,6 +6900,24 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                     current_count = get_team_occupancy_count(chatgpt)
             except Exception as exc:
                 logger.warning("[4/5] 超员 pending invite 清理异常: %s", exc)
+
+        usable_active = _count_pool_active_accounts(load_accounts(), require_auth=True)
+        target_active = _pool_active_target(TARGET)
+        if current_count >= TARGET and usable_active < target_active:
+            logger.warning(
+                "[4/5] Team 占位已满但可用子号不足: usable_active=%d/%d occupancy=%d/%d；检查 pending invite 占位",
+                usable_active,
+                target_active,
+                current_count,
+                TARGET,
+            )
+            try:
+                cancelled = _cancel_stale_pending_invites_for_capacity(chatgpt, stage_label="[4/5]")
+                if cancelled:
+                    current_count = get_team_occupancy_count(chatgpt)
+                    logger.info("[4/5] 已清理 pending invite 占位，重新计算占位: %d/%d", current_count, TARGET)
+            except Exception as exc:
+                logger.warning("[4/5] 可用子号不足时清理 pending invite 异常: %s", exc)
 
         vacancies = TARGET - current_count
 

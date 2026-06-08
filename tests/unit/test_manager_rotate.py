@@ -189,6 +189,42 @@ def test_cmd_rotate_can_defer_final_sync_when_running_as_api_task(monkeypatch):
     ]
 
 
+def test_cmd_rotate_clears_pending_invite_when_pool_underfilled(monkeypatch):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    events = []
+    count_values = iter([3, 2])
+
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
+    monkeypatch.setattr(config, "ROTATE_ALLOW_NEW_ACCOUNTS", False)
+    monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda force_auth_repair=False: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "load_accounts", lambda: [{"email": "yun9@yunfei.life", "status": manager.STATUS_ACTIVE}])
+    monkeypatch.setattr(manager, "_is_replaceable_pool_blocker", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(manager, "get_team_occupancy_count", lambda _chatgpt: next(count_values))
+    monkeypatch.setattr(manager, "_count_pool_active_accounts", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        manager,
+        "_cancel_stale_pending_invites_for_capacity",
+        lambda *_args, **_kwargs: events.append(("cancel_pending", None)) or ["yun12@yunfei.life"],
+    )
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [])
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("new account creation is disabled")),
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync_to_cpa", None)))
+
+    manager.cmd_rotate(target_seats=3)
+
+    assert ("cancel_pending", None) in events
+    assert events.index(("cancel_pending", None)) > events.index(("cmd_check", None))
+
+
 def test_prepare_remote_capacity_counts_pending_invites(monkeypatch):
     class FakeApi:
         def __init__(self):
@@ -278,6 +314,114 @@ def test_invite_to_team_refuses_when_pending_invite_still_occupies_capacity(monk
 
     assert manager.invite_to_team(fake, "yun13@yunfei.life") is False
     assert fake.invite_calls == []
+
+
+def test_sync_account_states_matches_hidden_member_by_auth_user_id(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-yun9@yunfei.life-team.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "email": "yun9@yunfei.life",
+                "account_id": "acct-1",
+                "access_token": _jwt_with_chatgpt_user_id("user-hidden-yun9"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    accounts = [
+        {
+            "email": "yun9@yunfei.life",
+            "status": manager.STATUS_STANDBY,
+            "auth_file": str(auth_file),
+        }
+    ]
+    updates = []
+
+    class FakeApi:
+        browser = True
+
+        def _api_fetch(self, method, path, body=None):
+            if method == "GET" and path.endswith("/users"):
+                return {
+                    "status": 200,
+                    "body": json.dumps(
+                        {
+                            "items": [
+                                {"id": "owner", "email": "owner@example.com", "role": "account-owner"},
+                                {"id": "user-hidden-yun9", "email": None, "role": "standard-user", "name": "yun"},
+                            ]
+                        }
+                    ),
+                }
+            return {"status": 404, "body": "{}"}
+
+    def fake_update(email, **fields):
+        updates.append((email, fields))
+        accounts[0].update(fields)
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(manager, "load_accounts", lambda: accounts)
+    monkeypatch.setattr(manager, "update_account", fake_update)
+    monkeypatch.setattr(manager, "save_accounts", lambda _accounts: None)
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda email: email == "owner@example.com")
+
+    manager.sync_account_states(FakeApi())
+
+    assert accounts[0]["status"] == manager.STATUS_ACTIVE
+    assert accounts[0]["workspace_account_id"] == "acct-1"
+    assert updates
+
+
+def test_cancel_stale_pending_invite_allows_standby_account_with_auth_file(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-yun12@yunfei.life-team.json"
+    auth_file.write_text("{}", encoding="utf-8")
+
+    class FakeApi:
+        def __init__(self):
+            self.invite_present = True
+            self.deleted = []
+
+        def _api_fetch(self, method, path, body=None):
+            if method == "GET" and path.endswith("/users"):
+                return {
+                    "status": 200,
+                    "body": json.dumps(
+                        {
+                            "items": [
+                                {"id": "owner", "email": "owner@example.com", "role": "account-owner"},
+                                {"id": "user-hidden", "email": None, "role": "standard-user"},
+                            ]
+                        }
+                    ),
+                }
+            if method == "GET" and path.endswith("/invites"):
+                items = [{"id": "inv-yun12", "email_address": "yun12@yunfei.life"}] if self.invite_present else []
+                return {"status": 200, "body": json.dumps({"items": items})}
+            if method == "DELETE" and "/invites/" in path:
+                self.deleted.append(path.rsplit("/", 1)[-1])
+                self.invite_present = False
+                return {"status": 204, "body": ""}
+            return {"status": 404, "body": "{}"}
+
+    fake = FakeApi()
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(
+        manager,
+        "load_accounts",
+        lambda: [
+            {
+                "email": "yun12@yunfei.life",
+                "status": manager.STATUS_STANDBY,
+                "auth_file": str(auth_file),
+            }
+        ],
+    )
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(manager, "delete_managed_account", lambda *args, **kwargs: None)
+
+    assert manager._cancel_stale_pending_invites_for_capacity(fake, stage_label="[test]") == ["yun12@yunfei.life"]
+    assert fake.deleted == ["inv-yun12"]
 
 
 def test_replaceable_pool_blocker_reason_reports_concrete_evidence(tmp_path):

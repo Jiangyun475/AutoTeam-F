@@ -192,3 +192,79 @@ AutoTeam-F/.venv/bin/python -m pytest \
 - 邀请前必须确认远端有空位。
 - 删除/取消后必须重新读取远端状态确认。
 - 无法确认时停止流程,不要继续拉号。
+
+## 2026-06-09 追加修复: pending invite 占位导致 active 不足
+
+### 新现象
+
+现场再次出现账号池和 Team 不一致:
+
+- 本地一度显示 9 个账号全是 `standby`。
+- 同步修复后只恢复出 1 个 `active`。
+- 远端 Team 实际为 `owner + 1 个子号成员 + 1 个 pending invite`。
+- pending invite 对应本地账号仍是 `standby`,并带有历史失败:
+
+```text
+invite accept unconfirmed (still pending after accept)
+```
+
+这说明该账号曾经尝试接受邀请,但远端仍保持 pending invite 状态。它占住了第二个子号 seat,但本地不能把它当作可用 active。
+
+### 新根因
+
+之前补了“pending invite 计入容量”,但还缺少两个边界:
+
+1. `sync_account_states()` 旧版本只按 email 判断 Team 成员。OpenAI 隐藏子号 email 后,本地无法把隐藏成员恢复为 active。
+2. `reinvite_account()` 在邀请已经发出但“没有收到邀请链接/接受邀请失败”时,只把账号保持 `standby`,没有取消自己刚产生的 pending invite。
+3. `cmd_rotate()` 看到 `members + invites >= target` 时容易认为 Team 已满并退出,即使本地 `active_with_auth < 2`。这会形成死锁:
+
+```text
+Team seat 被 pending invite 占满
+本地可用 active 不足
+fill/rotate 因为 occupancy 满而不补位
+pending invite 又不会自动消失
+```
+
+### 追加代码修改
+
+`src/autoteam/manager.py`:
+
+- `_reconcile_team_members()` 增加 hidden email → auth JWT `chatgpt_user_id` 精确匹配。
+- `sync_account_states()` 增加 hidden email → auth JWT `chatgpt_user_id` 精确匹配,并返回结构化结果。
+- `_can_cancel_pending_invite()` 允许取消“本地管理但非 active”的 pending invite,即使它有 auth_file。active auth 才保护。
+- 新增 `_cancel_pending_invite_for_email()`,用于按 email 取消单个 pending invite 并确认远端消失。
+- `reinvite_account()` 在“邀请邮件缺失/接受邀请失败”时主动取消对应 pending invite。
+- `cmd_rotate()` 增加守卫:如果 Team 占位已满但 `usable_active < target_active`,先清理 stale pending invite,再重新计算空位。
+
+`src/autoteam/api.py`:
+
+- `/api/sync/accounts` 不再把同步失败伪装成成功。`sync_account_states()` 返回 `ok=false` 时接口返回 502 和结构化原因。
+- `/api/admin/diagnose` 对 Playwright 页面跳转导致的单个探针异常做降级,避免诊断接口整体 500。
+- `/api/team/members` 对 hidden email 成员使用本地 auth JWT `chatgpt_user_id` 反查 email,前端可显示真实本地账号。
+- `/api/team/members` 失败时返回结构化错误,避免前端误以为空列表。
+
+测试新增:
+
+- `test_sync_account_states_matches_hidden_member_by_auth_user_id`
+- `test_cancel_stale_pending_invite_allows_standby_account_with_auth_file`
+- `test_cmd_rotate_clears_pending_invite_when_pool_underfilled`
+- `test_reinvite_account_cancels_pending_invite_when_invite_link_missing`
+
+### 本次运行态验证
+
+固定代理策略:
+
+```text
+PLAYWRIGHT_PROXY_URL=http://127.0.0.1:7901
+CLIProxyAPI proxy-url=http://127.0.0.1:7901
+```
+
+最终状态:
+
+- Team: `members=3`, `invites=0`。
+- Team 成员: `owner + yun7 + yun5`。
+- 本地账号池: `active=2`, `standby=7`。
+- CPA auth 目录:只保留 `yun7` 和 `yun5` 两个子号文件。
+- 自动巡检连续多轮显示 `available=2/2`,额度正常。
+
+本次过程中 `yun9` 被检测为 5h 额度耗尽,转回 `standby`;`yun5` 成功接受邀请、完成 Codex OAuth、保存 team auth,并同步到 CPA。

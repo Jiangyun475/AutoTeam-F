@@ -108,6 +108,45 @@ def test_reinvite_account_stops_http_transport_session_before_oauth(monkeypatch)
     assert any(kwargs.get("status") == accounts.STATUS_ACTIVE for _email, kwargs in updates)
 
 
+def test_reinvite_account_cancels_pending_invite_when_invite_link_missing(monkeypatch):
+    updates = []
+    cancelled = []
+
+    class FakeApi:
+        def __init__(self):
+            self.browser = True
+            self.stopped = False
+            self.started = False
+
+        def is_started(self):
+            return bool(self.browser or self.started)
+
+        def start(self):
+            self.started = True
+            self.browser = True
+
+        def stop(self):
+            self.stopped = True
+            self.browser = False
+
+    api = FakeApi()
+
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_wait_for_invite_link", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        manager,
+        "_cancel_pending_invite_for_email",
+        lambda _api, email, **_kwargs: cancelled.append(email) or True,
+    )
+    monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
+
+    result = manager.reinvite_account(api, None, {"email": "tmp-user@example.com", "password": "secret"})
+
+    assert result is False
+    assert cancelled == ["tmp-user@example.com"]
+    assert updates[-1] == ("tmp-user@example.com", {"status": accounts.STATUS_STANDBY})
+
+
 def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(monkeypatch):
     """SPEC-2 §3.3 plan_drift — 白名单内但 plan!=team → STATUS_AUTH_INVALID(不是 STANDBY)。
 
