@@ -730,3 +730,98 @@ def test_cmd_rotate_target2_refills_after_exhausted_removal_despite_transient_ov
     assert next(acc for acc in state["accounts"] if acc["email"] == "standby@example.com")[
         "status"
     ] == manager.STATUS_ACTIVE
+
+
+def test_replace_single_reuses_standby_when_old_team_token_is_revoked_after_reset(tmp_path, monkeypatch):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    mail = _FakeMailClient()
+    standby_auth = tmp_path / "standby.json"
+    standby_auth.write_text('{"access_token": "revoked-old-team-token"}', encoding="utf-8")
+    events = []
+
+    standby = {
+        "email": "standby@example.com",
+        "status": manager.STATUS_STANDBY,
+        "auth_file": str(standby_auth),
+        "_quota_recovered": True,
+        "last_quota": {
+            "primary_pct": 10,
+            "primary_resets_at": 1,
+            "weekly_pct": 10,
+            "weekly_resets_at": 1,
+        },
+    }
+
+    monkeypatch.setattr(config, "ROTATE_ALLOW_NEW_ACCOUNTS", False)
+    monkeypatch.setattr(manager, "remove_from_team", lambda *_a, **_kw: events.append(("remove", _a[1])) or "removed")
+    monkeypatch.setattr(manager, "_wait_for_remote_capacity_after_removal", lambda *_a, **_kw: None)
+    monkeypatch.setattr(manager, "update_account", lambda email, **kw: events.append(("update", email, kw.get("status"))))
+    monkeypatch.setattr(manager, "get_team_occupancy_count", lambda _chatgpt: 2)
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [standby])
+    monkeypatch.setattr(manager, "check_codex_quota", lambda token: ("auth_error", None))
+    monkeypatch.setattr(
+        manager,
+        "reinvite_account",
+        lambda _chatgpt, _mail, acc: events.append(("reinvite", acc["email"])) or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("revoked old standby token should not force new-account fallback")
+        ),
+    )
+
+    outcome = manager._replace_single(chatgpt, mail, "old@example.com", reason="unit")
+
+    assert outcome == {"kicked": True, "filled_by": "standby@example.com", "method": "reuse", "error": None}
+    assert ("reinvite", "standby@example.com") in events
+
+
+def test_replace_single_does_not_reuse_revoked_standby_when_history_still_low(tmp_path, monkeypatch):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    mail = _FakeMailClient()
+    standby_auth = tmp_path / "standby.json"
+    standby_auth.write_text('{"access_token": "revoked-old-team-token"}', encoding="utf-8")
+    events = []
+
+    standby = {
+        "email": "standby@example.com",
+        "status": manager.STATUS_STANDBY,
+        "auth_file": str(standby_auth),
+        "_quota_recovered": True,
+        "last_quota": {
+            "primary_pct": 99,
+            "primary_resets_at": 9_999_999_999,
+            "weekly_pct": 10,
+            "weekly_resets_at": 9_999_999_999,
+        },
+    }
+
+    monkeypatch.setattr(config, "ROTATE_ALLOW_NEW_ACCOUNTS", False)
+    monkeypatch.setattr(manager, "remove_from_team", lambda *_a, **_kw: events.append(("remove", _a[1])) or "removed")
+    monkeypatch.setattr(manager, "_wait_for_remote_capacity_after_removal", lambda *_a, **_kw: None)
+    monkeypatch.setattr(manager, "update_account", lambda email, **kw: events.append(("update", email, kw.get("status"))))
+    monkeypatch.setattr(manager, "get_team_occupancy_count", lambda _chatgpt: 2)
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [standby])
+    monkeypatch.setattr(manager, "check_codex_quota", lambda token: ("auth_error", None))
+    monkeypatch.setattr(
+        manager,
+        "reinvite_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("low historical quota should not be reinvited")
+        ),
+    )
+
+    outcome = manager._replace_single(chatgpt, mail, "old@example.com", reason="unit")
+
+    assert outcome == {
+        "kicked": True,
+        "filled_by": None,
+        "method": None,
+        "error": "new_account_creation_disabled",
+    }

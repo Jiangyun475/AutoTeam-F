@@ -6347,79 +6347,46 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
         and not _is_main_account_email(a.get("email"))
         and (a.get("email") or "").lower() != email_lc
     ]
-    for acc in standby_list:
-        skip_reason = _auto_reuse_skip_reason(acc)
-        if skip_reason:
-            logger.info("[替换] 跳过 %s(%s)", acc.get("email"), skip_reason)
-            continue
-        cand_email = acc.get("email")
+    try:
+        from autoteam.config import AUTO_CHECK_THRESHOLD
 
-        # 额度二次验证:不能只信 get_standby_accounts() 的 _quota_recovered(它只看
-        # quota_resets_at 这种粗估时间)。之前有 bug 就是把还在 exhausted 窗口的
-        # standby 反复 reinvite 进 Team,账号一进来就 0% 立马被 kick,把同一批号
-        # 来回洗,席位始终干空。这里直接拿 auth_file 的 access_token 打一次 wham,
-        # 只有 API 确认 "ok 且剩余 >= threshold" 才允许复用。
         try:
-            from autoteam.config import AUTO_CHECK_THRESHOLD
+            from autoteam.api import _auto_check_config
 
-            try:
-                from autoteam.api import _auto_check_config
+            threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
+        except ImportError:
+            threshold = AUTO_CHECK_THRESHOLD
+    except Exception:
+        threshold = 10
 
-                threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
-            except ImportError:
-                threshold = AUTO_CHECK_THRESHOLD
-        except Exception:
-            threshold = 10
-
-        auth_file = acc.get("auth_file")
-        quota_ok = False
-        if auth_file and Path(auth_file).exists():
-            try:
-                auth_data = json.loads(read_text(Path(auth_file)))
-                access_token = auth_data.get("access_token")
-                if access_token:
-                    status_str, info = check_codex_quota(access_token)
-                    if status_str == "ok" and isinstance(info, dict):
-                        # 实测结果统一刷新 last_quota,避免 UI/下游看到陈旧数据
-                        update_account(cand_email, last_quota=info)
-                        p_remain = 100 - info.get("primary_pct", 0)
-                        if p_remain >= threshold:
-                            quota_ok = True
-                        else:
-                            logger.info("[替换] 跳过 %s(实测 5h 剩余 %d%% < %d%%)", cand_email, p_remain, threshold)
-                            continue
-                    elif status_str == "exhausted":
-                        quota_info = quota_result_quota_info(info) or {}
-                        if quota_info:
-                            update_account(cand_email, last_quota=quota_info)
-                        logger.info("[替换] 跳过 %s(实测 exhausted)", cand_email)
-                        continue
-                    # auth_error:token 失效,不是"额度真恢复"的证据,跳过
-                    elif status_str == "auth_error":
-                        logger.info("[替换] 跳过 %s(token auth_error,无法验证额度)", cand_email)
-                        continue
-                    # network_error:临时网络故障,不能当"额度恢复"凭证,本轮不复用,
-                    # 等下一轮再试(不动 acc 状态)
-                    elif status_str == "network_error":
-                        logger.info("[替换] 跳过 %s(临时网络错误,本轮无法验证额度)", cand_email)
-                        continue
-            except Exception as exc:
-                logger.info("[替换] %s 额度验证抛异常(跳过): %s", cand_email, exc)
-                continue
-        if not quota_ok:
-            # 没 auth_file 或验证没通过都跳过,宁可去创建新号也别把 0% 账号塞回 Team
-            logger.info("[替换] 跳过 %s(无 auth_file 或额度未通过验证)", cand_email)
-            continue
-
-        logger.info("[替换] 尝试复用 standby: %s", cand_email)
+    def _replace_chatgpt_provider():
         if not _chatgpt_session_ready(chatgpt):
             chatgpt.start()
-        if reinvite_account(chatgpt, mail_client, acc):
+        return chatgpt
+
+    def _replace_mail_provider(_acc):
+        return mail_client
+
+    for acc in standby_list:
+        cand_email = acc.get("email")
+        # 与 cmd_rotate 的 standby 复用共用同一套预检:
+        # standby 被踢出 Team 后旧 token 可能被服务端 revoke,这不能直接等价为
+        # "账号不可复用"。是否真的可用由 reinvite_account 中的新 OAuth + 新 token
+        # wham 校验最终确认。
+        result = _reuse_one_standby(
+            acc,
+            threshold,
+            chatgpt_provider=_replace_chatgpt_provider,
+            mail_provider=_replace_mail_provider,
+        )
+        if result.get("result") == "reused":
             outcome["filled_by"] = cand_email
             outcome["method"] = "reuse"
             logger.info("[替换] 补位成功(复用): %s → %s", email, cand_email)
             return outcome
-        # reinvite_account 内部失败已 cleanup,继续下一个候选
+        if result.get("result") == "failed":
+            logger.info("[替换] 复用 %s 失败: %s", cand_email, result.get("error") or "unknown")
+        # skipped/failed 都继续下一个候选; reinvite_account 内部失败已 cleanup.
 
     # 4. 无可复用 standby → 创建新号
     from autoteam.config import ROTATE_ALLOW_NEW_ACCOUNTS
