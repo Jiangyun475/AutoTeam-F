@@ -755,6 +755,7 @@ def test_sanitize_account_exposes_next_usable_for_standby(monkeypatch):
     assert sanitized["next_usable_at"] == 1_600
     assert sanitized["next_usable_reason"] == "quota_resets_at"
     assert sanitized["pool_sort_bucket"] == 40
+    assert sanitized["pool_rank_detail"] == "5h剩余 0% · 复用冷却 10m"
 
 
 def test_sanitize_account_exposes_quota_rank_detail(monkeypatch):

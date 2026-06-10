@@ -164,7 +164,7 @@
                 <div class="font-mono text-[11px] text-ink-700" :title="acc.pool_rank_detail || ''">{{ nextUsableText(acc) }}</div>
                 <div class="text-[10px] text-ink-400 mt-0.5">{{ nextUsableReason(acc) }}</div>
                 <div v-if="acc.pool_rank_detail"
-                  class="text-[10px] text-ink-500 mt-0.5 max-w-[180px] truncate"
+                  class="text-[10px] text-ink-500 mt-0.5 max-w-[220px] leading-snug whitespace-normal break-words"
                   :title="acc.pool_rank_detail">
                   {{ acc.pool_rank_detail }}
                 </div>

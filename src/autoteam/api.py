@@ -1266,6 +1266,17 @@ def _quota_ts(quota_info: dict | None, key: str) -> float | None:
     return None
 
 
+def _format_pool_wait(seconds: float) -> str:
+    total_minutes = max(1, int((seconds + 59) // 60))
+    if total_minutes < 60:
+        return f"{total_minutes}m"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours:02d}h"
+
+
 def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dict:
     raw_status = str(acc.get("status") or "")
     now = time.time()
@@ -1341,8 +1352,7 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
     if weekly_remaining_pct is not None:
         detail_parts.append(f"周剩余 {weekly_remaining_pct}%")
     if raw_status in ("standby", "exhausted") and quota_resets_at and quota_resets_at > now:
-        mins = max(1, int((quota_resets_at - now + 59) // 60))
-        detail_parts.append(f"{mins} 分钟后再参与复用")
+        detail_parts.append(f"复用冷却 {_format_pool_wait(quota_resets_at - now)}")
     if reason == "ready_low_weekly":
         detail_parts.append("周额度偏低,有其它号时会靠后")
 
