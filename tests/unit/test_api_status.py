@@ -757,6 +757,63 @@ def test_sanitize_account_exposes_next_usable_for_standby(monkeypatch):
     assert sanitized["pool_sort_bucket"] == 40
 
 
+def test_sanitize_account_exposes_quota_rank_detail(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "ready@example.com",
+            "status": accounts.STATUS_STANDBY,
+            "quota_resets_at": 900,
+            "last_quota": {"primary_pct": 42, "weekly_pct": 65},
+        }
+    )
+
+    assert sanitized["primary_remaining_pct"] == 58
+    assert sanitized["weekly_remaining_pct"] == 35
+    assert sanitized["pool_rank_detail"] == "5h剩余 58% · 周剩余 35%"
+
+
+def test_sanitize_account_marks_weekly_exhausted_standby(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "weekly-empty@example.com",
+            "status": accounts.STATUS_STANDBY,
+            "quota_resets_at": 900,
+            "last_quota": {"primary_pct": 0, "weekly_pct": 100, "weekly_resets_at": 2_000},
+        }
+    )
+
+    assert sanitized["weekly_remaining_pct"] == 0
+    assert sanitized["next_usable_reason"] == "weekly_exhausted"
+    assert sanitized["next_usable_at"] == 2_000
+    assert sanitized["pool_sort_bucket"] == 55
+
+
+def test_sanitize_account_marks_ready_low_weekly_without_blocking_reuse(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+    monkeypatch.setattr(config, "AUTO_CHECK_THRESHOLD", 10)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "low-weekly@example.com",
+            "status": accounts.STATUS_STANDBY,
+            "quota_resets_at": 900,
+            "last_quota": {"primary_pct": 0, "weekly_pct": 95},
+        }
+    )
+
+    assert sanitized["next_usable_reason"] == "ready_low_weekly"
+    assert sanitized["next_usable_at"] is None
+    assert sanitized["pool_sort_bucket"] == 20
+    assert "周额度偏低" in sanitized["pool_rank_detail"]
+
+
 def test_account_pool_sort_orders_active_ready_waiting_and_disabled(monkeypatch):
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
     monkeypatch.setattr(api.time, "time", lambda: 1_000)
@@ -775,6 +832,55 @@ def test_account_pool_sort_orders_active_ready_waiting_and_disabled(monkeypatch)
         "ready@example.com",
         "waiting@example.com",
         "disabled@example.com",
+    ]
+
+
+def test_account_pool_sort_orders_ready_standby_by_weekly_then_primary(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+
+    rows = [
+        api._sanitize_account(
+            {
+                "email": "low-weekly@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": 900,
+                "last_quota": {"primary_pct": 0, "weekly_pct": 80},
+            }
+        ),
+        api._sanitize_account(
+            {
+                "email": "high-weekly-low-primary@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": 900,
+                "last_quota": {"primary_pct": 90, "weekly_pct": 10},
+            }
+        ),
+        api._sanitize_account(
+            {
+                "email": "high-weekly-high-primary@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": 900,
+                "last_quota": {"primary_pct": 20, "weekly_pct": 10},
+            }
+        ),
+        api._sanitize_account(
+            {
+                "email": "waiting-best-quota@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": 1_500,
+                "last_quota": {"primary_pct": 0, "weekly_pct": 0},
+            }
+        ),
+    ]
+
+    rows.sort(key=api._account_pool_sort_key)
+
+    assert [row["email"] for row in rows] == [
+        "high-weekly-high-primary@example.com",
+        "high-weekly-low-primary@example.com",
+        "low-weekly@example.com",
+        "waiting-best-quota@example.com",
     ]
 
 

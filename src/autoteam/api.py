@@ -1272,6 +1272,8 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
     quota_info = quota_snapshot if isinstance(quota_snapshot, dict) else acc.get("last_quota")
     primary_pct = _quota_int(quota_info, "primary_pct")
     weekly_pct = _quota_int(quota_info, "weekly_pct")
+    primary_remaining_pct = max(0, min(100, 100 - primary_pct)) if primary_pct is not None else None
+    weekly_remaining_pct = max(0, min(100, 100 - weekly_pct)) if weekly_pct is not None else None
     primary_resets_at = _quota_ts(quota_info, "primary_resets_at")
     weekly_resets_at = _quota_ts(quota_info, "weekly_resets_at")
     quota_resets_at = acc.get("quota_resets_at")
@@ -1281,8 +1283,16 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
     if not isinstance(auth_retry_after, (int, float)) or auth_retry_after <= 0:
         auth_retry_after = None
 
+    try:
+        from autoteam.config import AUTO_CHECK_THRESHOLD
+
+        quota_threshold = int(AUTO_CHECK_THRESHOLD)
+    except Exception:
+        quota_threshold = 10
+
     next_usable_at = None
     reason = "unknown"
+    detail_parts: list[str] = []
     bucket = 60
 
     if _is_main_account_email(acc.get("email")):
@@ -1304,10 +1314,16 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
             bucket = 40
             next_usable_at = quota_resets_at
             reason = "quota_resets_at"
+        elif weekly_remaining_pct is not None and weekly_remaining_pct <= 0 and weekly_resets_at and weekly_resets_at > now:
+            bucket = 55
+            next_usable_at = weekly_resets_at
+            reason = "weekly_exhausted"
         else:
             bucket = 20
             next_usable_at = None
             reason = "ready_now"
+            if weekly_remaining_pct is not None and weekly_remaining_pct < quota_threshold:
+                reason = "ready_low_weekly"
     elif raw_status == "personal":
         bucket = 30
         next_usable_at = primary_resets_at
@@ -1320,14 +1336,27 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
         else:
             reason = raw_status
 
+    if primary_remaining_pct is not None:
+        detail_parts.append(f"5h剩余 {primary_remaining_pct}%")
+    if weekly_remaining_pct is not None:
+        detail_parts.append(f"周剩余 {weekly_remaining_pct}%")
+    if raw_status in ("standby", "exhausted") and quota_resets_at and quota_resets_at > now:
+        mins = max(1, int((quota_resets_at - now + 59) // 60))
+        detail_parts.append(f"{mins} 分钟后再参与复用")
+    if reason == "ready_low_weekly":
+        detail_parts.append("周额度偏低,有其它号时会靠后")
+
     return {
         "pool_sort_bucket": bucket,
         "next_usable_at": next_usable_at,
         "next_usable_reason": reason,
         "primary_pct": primary_pct,
         "weekly_pct": weekly_pct,
+        "primary_remaining_pct": primary_remaining_pct,
+        "weekly_remaining_pct": weekly_remaining_pct,
         "primary_resets_at": primary_resets_at,
         "weekly_resets_at": weekly_resets_at,
+        "pool_rank_detail": " · ".join(detail_parts),
     }
 
 
@@ -1342,10 +1371,28 @@ def _account_pool_sort_key(acc: dict) -> tuple:
     primary_pct = schedule.get("primary_pct")
     if not isinstance(primary_pct, (int, float)):
         primary_pct = 999
+    primary_remaining = schedule.get("primary_remaining_pct")
+    primary_missing = not isinstance(primary_remaining, (int, float))
+    if primary_missing:
+        primary_remaining = 0
+    weekly_remaining = schedule.get("weekly_remaining_pct")
+    weekly_missing = not isinstance(weekly_remaining, (int, float))
+    if weekly_missing:
+        weekly_remaining = 0
     created_at = acc.get("created_at")
     if not isinstance(created_at, (int, float)):
         created_at = 0
-    return (int(bucket), float(next_usable_at), int(primary_pct), float(created_at), str(acc.get("email") or ""))
+    return (
+        int(bucket),
+        float(next_usable_at),
+        weekly_missing,
+        -int(weekly_remaining),
+        primary_missing,
+        -int(primary_remaining),
+        int(primary_pct),
+        float(created_at),
+        str(acc.get("email") or ""),
+    )
 
 
 def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
@@ -1363,6 +1410,9 @@ def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
     sanitized["pool_sort_bucket"] = schedule["pool_sort_bucket"]
     sanitized["next_usable_at"] = schedule["next_usable_at"]
     sanitized["next_usable_reason"] = schedule["next_usable_reason"]
+    sanitized["primary_remaining_pct"] = schedule["primary_remaining_pct"]
+    sanitized["weekly_remaining_pct"] = schedule["weekly_remaining_pct"]
+    sanitized["pool_rank_detail"] = schedule["pool_rank_detail"]
     return sanitized
 
 

@@ -286,7 +286,8 @@ export function masterHealthSeverity(masterHealth, minGraceUntil = null) {
 export function quotaRemainingPct(qi, type = 'primary') {
   if (!qi) return null
   const pct = type === 'primary' ? qi.primary_pct : qi.weekly_pct
-  return 100 - (pct || 0)
+  if (typeof pct !== 'number' || Number.isNaN(pct)) return null
+  return Math.max(0, Math.min(100, 100 - pct))
 }
 
 export function quotaPctText(qi, type = 'primary') {

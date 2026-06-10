@@ -31,7 +31,7 @@
         <div>
           <h2 class="text-base font-bold text-ink-950 tracking-tight">账号列表</h2>
           <p class="text-[11px] text-ink-500 mt-0.5">
-            {{ totalAccounts }} 个账号 · 每页 {{ ACCOUNT_PAGE_SIZE }} 条 · 排序: 使用中 → 可复用 → 等刷新 → 异常 → 禁用
+            {{ totalAccounts }} 个账号 · 每页 {{ ACCOUNT_PAGE_SIZE }} 条 · 排序: 使用中 → 可复用(周/5h高者优先) → 等刷新 → 异常 → 禁用
           </p>
         </div>
         <div class="flex items-center gap-2">
@@ -161,8 +161,13 @@
               </td>
               <td class="px-4 py-3.5 text-ink-500 font-mono text-[11px]">{{ quotaReset(acc, 'primary') }}</td>
               <td class="px-4 py-3.5">
-                <div class="font-mono text-[11px] text-ink-700">{{ nextUsableText(acc) }}</div>
+                <div class="font-mono text-[11px] text-ink-700" :title="acc.pool_rank_detail || ''">{{ nextUsableText(acc) }}</div>
                 <div class="text-[10px] text-ink-400 mt-0.5">{{ nextUsableReason(acc) }}</div>
+                <div v-if="acc.pool_rank_detail"
+                  class="text-[10px] text-ink-500 mt-0.5 max-w-[180px] truncate"
+                  :title="acc.pool_rank_detail">
+                  {{ acc.pool_rank_detail }}
+                </div>
               </td>
               <td class="px-4 py-3.5 text-ink-500 font-mono text-[11px]">{{ quotaReset(acc, 'weekly') }}</td>
               <td class="px-4 py-3.5 text-right">
@@ -537,7 +542,9 @@ function nextUsableReason(acc) {
     main_account: '母号',
     active_5h_reset: '当前使用中',
     ready_now: '已可复用',
+    ready_low_weekly: '周额度偏低',
     quota_resets_at: '等额度刷新',
+    weekly_exhausted: '周额度耗尽',
     auth_retry_after: '等登录重试',
     personal: '个人号',
     disabled: '已禁用',

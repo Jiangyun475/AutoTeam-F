@@ -287,6 +287,40 @@ def get_personal_accounts():
     return [a for a in load_accounts() if a["status"] == STATUS_PERSONAL and not _is_main_account_email(a.get("email"))]
 
 
+def _quota_remaining_pct(acc: dict, key: str) -> int | None:
+    quota = acc.get("last_quota") if isinstance(acc.get("last_quota"), dict) else {}
+    value = quota.get(key)
+    if not isinstance(value, (int, float)):
+        return None
+    return max(0, min(100, 100 - int(value)))
+
+
+def _standby_sort_key(acc: dict) -> tuple:
+    recovered = bool(acc.get("_quota_recovered", False))
+    resets_at = acc.get("quota_resets_at")
+    if not isinstance(resets_at, (int, float)) or resets_at <= 0:
+        resets_at = 0
+    exhausted_at = acc.get("quota_exhausted_at")
+    if not isinstance(exhausted_at, (int, float)) or exhausted_at <= 0:
+        exhausted_at = 0
+
+    primary_remaining = _quota_remaining_pct(acc, "primary_pct")
+    weekly_remaining = _quota_remaining_pct(acc, "weekly_pct")
+
+    # 先保证 5h 已恢复的号排前；同一组内优先使用周额度更充足、5h 更充足的号。
+    # 缺少额度快照的旧记录保留可用性，但排在有明确快照的候选之后。
+    return (
+        not recovered,
+        0 if recovered else float(resets_at or 9999999999),
+        weekly_remaining is None,
+        -(weekly_remaining if weekly_remaining is not None else 0),
+        primary_remaining is None,
+        -(primary_remaining if primary_remaining is not None else 0),
+        float(exhausted_at),
+        str(acc.get("email") or ""),
+    )
+
+
 def get_standby_accounts():
     """获取所有待命账号（已移出 team，可能额度已恢复）"""
     accounts = load_accounts()
@@ -306,8 +340,8 @@ def get_standby_accounts():
                 # 有恢复时间，看是否已过
                 a["_quota_recovered"] = now >= resets_at
             standby.append(a)
-    # 已恢复的排前面
-    standby.sort(key=lambda x: (not x.get("_quota_recovered", False), x.get("quota_exhausted_at") or 0))
+    # 已恢复的排前面；同为已恢复时优先周额度/5h 额度更健康的账号。
+    standby.sort(key=_standby_sort_key)
     return standby
 
 

@@ -98,6 +98,87 @@ def test_get_standby_accounts_orders_recovered_first_and_skips_main_account(tmp_
     assert accounts.get_next_reusable_account()["email"] == "always@example.com"
 
 
+def test_get_standby_accounts_prefers_weekly_then_primary_quota_within_recovered(tmp_path, monkeypatch):
+    accounts_file = tmp_path / "accounts.json"
+    monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
+    monkeypatch.setattr(accounts, "get_admin_email", lambda: "owner@example.com")
+
+    now = time.time()
+    accounts.save_accounts(
+        [
+            {
+                "email": "low-weekly@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": now - 60,
+                "quota_exhausted_at": now - 300,
+                "last_quota": {"primary_pct": 0, "weekly_pct": 80},
+            },
+            {
+                "email": "high-weekly-low-primary@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": now - 60,
+                "quota_exhausted_at": now - 200,
+                "last_quota": {"primary_pct": 70, "weekly_pct": 20},
+            },
+            {
+                "email": "high-weekly-high-primary@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": now - 60,
+                "quota_exhausted_at": now - 100,
+                "last_quota": {"primary_pct": 10, "weekly_pct": 20},
+            },
+            {
+                "email": "unknown-quota@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": now - 60,
+                "quota_exhausted_at": now - 50,
+            },
+        ]
+    )
+
+    standby = accounts.get_standby_accounts()
+
+    assert [item["email"] for item in standby] == [
+        "high-weekly-high-primary@example.com",
+        "high-weekly-low-primary@example.com",
+        "low-weekly@example.com",
+        "unknown-quota@example.com",
+    ]
+
+
+def test_get_standby_accounts_keeps_waiting_after_recovered_even_with_better_quota(tmp_path, monkeypatch):
+    accounts_file = tmp_path / "accounts.json"
+    monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
+    monkeypatch.setattr(accounts, "get_admin_email", lambda: "owner@example.com")
+
+    now = time.time()
+    accounts.save_accounts(
+        [
+            {
+                "email": "ready-low-weekly@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": now - 60,
+                "last_quota": {"primary_pct": 90, "weekly_pct": 95},
+            },
+            {
+                "email": "waiting-high-weekly@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": now + 600,
+                "last_quota": {"primary_pct": 0, "weekly_pct": 0},
+            },
+        ]
+    )
+
+    standby = accounts.get_standby_accounts()
+
+    assert [item["email"] for item in standby] == [
+        "ready-low-weekly@example.com",
+        "waiting-high-weekly@example.com",
+    ]
+    assert standby[0]["_quota_recovered"] is True
+    assert standby[1]["_quota_recovered"] is False
+
+
 def test_load_accounts_normalizes_disabled_field(tmp_path, monkeypatch):
     accounts_file = tmp_path / "accounts.json"
     monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
