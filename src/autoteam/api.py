@@ -1277,6 +1277,23 @@ def _format_pool_wait(seconds: float) -> str:
     return f"{days}d{hours:02d}h"
 
 
+def _quota_blocking_window(
+    *,
+    primary_remaining_pct: int | None,
+    weekly_remaining_pct: int | None,
+    primary_resets_at: float | None,
+    weekly_resets_at: float | None,
+    now: float,
+) -> tuple[str, float | None]:
+    if primary_remaining_pct is not None and primary_remaining_pct <= 0:
+        if not primary_resets_at or primary_resets_at > now:
+            return "primary_exhausted", primary_resets_at
+    if weekly_remaining_pct is not None and weekly_remaining_pct <= 0:
+        if not weekly_resets_at or weekly_resets_at > now:
+            return "weekly_exhausted", weekly_resets_at
+    return "", None
+
+
 def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dict:
     raw_status = str(acc.get("status") or "")
     now = time.time()
@@ -1317,18 +1334,29 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
         next_usable_at = primary_resets_at
         reason = "active_5h_reset"
     elif raw_status in ("standby", "exhausted"):
+        quota_block_reason, quota_block_until = _quota_blocking_window(
+            primary_remaining_pct=primary_remaining_pct,
+            weekly_remaining_pct=weekly_remaining_pct,
+            primary_resets_at=primary_resets_at,
+            weekly_resets_at=weekly_resets_at,
+            now=now,
+        )
         if auth_retry_after and auth_retry_after > now:
             bucket = 45
             next_usable_at = auth_retry_after
             reason = "auth_retry_after"
-        elif quota_resets_at and quota_resets_at > now:
+        elif quota_block_reason:
+            bucket = 55 if quota_block_reason == "weekly_exhausted" else 40
+            next_usable_at = quota_block_until or quota_resets_at
+            reason = quota_block_reason
+        elif primary_remaining_pct is not None and primary_remaining_pct < quota_threshold:
+            bucket = 35
+            next_usable_at = primary_resets_at
+            reason = "primary_low"
+        elif quota_resets_at and quota_resets_at > now and primary_remaining_pct is None:
             bucket = 40
             next_usable_at = quota_resets_at
             reason = "quota_resets_at"
-        elif weekly_remaining_pct is not None and weekly_remaining_pct <= 0 and weekly_resets_at and weekly_resets_at > now:
-            bucket = 55
-            next_usable_at = weekly_resets_at
-            reason = "weekly_exhausted"
         else:
             bucket = 20
             next_usable_at = None
@@ -1351,7 +1379,9 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
         detail_parts.append(f"5h剩余 {primary_remaining_pct}%")
     if weekly_remaining_pct is not None:
         detail_parts.append(f"周剩余 {weekly_remaining_pct}%")
-    if raw_status in ("standby", "exhausted") and quota_resets_at and quota_resets_at > now:
+    if reason == "primary_low":
+        detail_parts.append(f"5h低于阈值 {quota_threshold}%")
+    if reason == "quota_resets_at" and quota_resets_at and quota_resets_at > now:
         detail_parts.append(f"复用冷却 {_format_pool_wait(quota_resets_at - now)}")
     if reason == "ready_low_weekly":
         detail_parts.append("周额度偏低,有其它号时会靠后")

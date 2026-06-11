@@ -753,9 +753,61 @@ def test_sanitize_account_exposes_next_usable_for_standby(monkeypatch):
     )
 
     assert sanitized["next_usable_at"] == 1_600
-    assert sanitized["next_usable_reason"] == "quota_resets_at"
+    assert sanitized["next_usable_reason"] == "primary_exhausted"
     assert sanitized["pool_sort_bucket"] == 40
-    assert sanitized["pool_rank_detail"] == "5h剩余 0% · 复用冷却 10m"
+    assert sanitized["pool_rank_detail"] == "5h剩余 0%"
+
+
+def test_sanitize_account_ignores_stale_quota_resets_when_quota_snapshot_has_remaining(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "stale-cooldown@example.com",
+            "status": accounts.STATUS_STANDBY,
+            "quota_resets_at": 1_600,
+            "last_quota": {
+                "primary_pct": 1,
+                "primary_resets_at": 1_600,
+                "weekly_pct": 37,
+                "weekly_resets_at": 3_000,
+            },
+        }
+    )
+
+    assert sanitized["primary_remaining_pct"] == 99
+    assert sanitized["weekly_remaining_pct"] == 63
+    assert sanitized["next_usable_at"] is None
+    assert sanitized["next_usable_reason"] == "ready_now"
+    assert sanitized["pool_sort_bucket"] == 20
+    assert sanitized["pool_rank_detail"] == "5h剩余 99% · 周剩余 63%"
+
+
+def test_sanitize_account_marks_primary_low_without_using_stale_cooldown(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+    monkeypatch.setattr(config, "AUTO_CHECK_THRESHOLD", 11)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "primary-low@example.com",
+            "status": accounts.STATUS_STANDBY,
+            "quota_resets_at": 1_600,
+            "last_quota": {
+                "primary_pct": 98,
+                "primary_resets_at": 1_600,
+                "weekly_pct": 52,
+                "weekly_resets_at": 3_000,
+            },
+        }
+    )
+
+    assert sanitized["primary_remaining_pct"] == 2
+    assert sanitized["next_usable_reason"] == "primary_low"
+    assert sanitized["next_usable_at"] == 1_600
+    assert sanitized["pool_sort_bucket"] == 35
+    assert sanitized["pool_rank_detail"] == "5h剩余 2% · 周剩余 48% · 5h低于阈值 11%"
 
 
 def test_sanitize_account_exposes_quota_rank_detail(monkeypatch):
@@ -854,7 +906,7 @@ def test_account_pool_sort_orders_ready_standby_by_weekly_then_primary(monkeypat
                 "email": "high-weekly-low-primary@example.com",
                 "status": accounts.STATUS_STANDBY,
                 "quota_resets_at": 900,
-                "last_quota": {"primary_pct": 90, "weekly_pct": 10},
+                "last_quota": {"primary_pct": 70, "weekly_pct": 10},
             }
         ),
         api._sanitize_account(
@@ -870,7 +922,7 @@ def test_account_pool_sort_orders_ready_standby_by_weekly_then_primary(monkeypat
                 "email": "waiting-best-quota@example.com",
                 "status": accounts.STATUS_STANDBY,
                 "quota_resets_at": 1_500,
-                "last_quota": {"primary_pct": 0, "weekly_pct": 0},
+                "last_quota": {"primary_pct": 100, "primary_resets_at": 1_500, "weekly_pct": 0},
             }
         ),
     ]

@@ -542,6 +542,8 @@ function nextUsableReason(acc) {
     main_account: '母号',
     active_5h_reset: '当前使用中',
     ready_now: '已可复用',
+    primary_low: '5h额度偏低',
+    primary_exhausted: '5h额度耗尽',
     ready_low_weekly: '周额度偏低',
     quota_resets_at: '等额度刷新',
     weekly_exhausted: '周额度耗尽',

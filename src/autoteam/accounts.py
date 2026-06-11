@@ -295,6 +295,47 @@ def _quota_remaining_pct(acc: dict, key: str) -> int | None:
     return max(0, min(100, 100 - int(value)))
 
 
+def _quota_ts(acc: dict, key: str) -> float | None:
+    quota = acc.get("last_quota") if isinstance(acc.get("last_quota"), dict) else {}
+    value = quota.get(key)
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+def _quota_snapshot_recovered(acc: dict, now: float) -> bool | None:
+    """Return recovered decision from last_quota, or None when no useful snapshot exists."""
+    quota = acc.get("last_quota") if isinstance(acc.get("last_quota"), dict) else {}
+    if not quota:
+        return None
+
+    primary = _quota_remaining_pct(acc, "primary_pct")
+    weekly = _quota_remaining_pct(acc, "weekly_pct")
+    if primary is None and weekly is None:
+        return None
+
+    if quota.get("primary_total") == 0 or quota.get("no_quota") is True:
+        return False
+
+    primary_reset = _quota_ts(acc, "primary_resets_at")
+    weekly_reset = _quota_ts(acc, "weekly_resets_at")
+    if primary is not None and primary <= 0 and (not primary_reset or primary_reset > now):
+        return False
+    if weekly is not None and weekly <= 0 and (not weekly_reset or weekly_reset > now):
+        return False
+
+    return True
+
+
+def _auto_check_threshold() -> int:
+    try:
+        from autoteam.config import AUTO_CHECK_THRESHOLD
+
+        return int(AUTO_CHECK_THRESHOLD)
+    except Exception:
+        return 10
+
+
 def _standby_sort_key(acc: dict) -> tuple:
     recovered = bool(acc.get("_quota_recovered", False))
     resets_at = acc.get("quota_resets_at")
@@ -306,12 +347,15 @@ def _standby_sort_key(acc: dict) -> tuple:
 
     primary_remaining = _quota_remaining_pct(acc, "primary_pct")
     weekly_remaining = _quota_remaining_pct(acc, "weekly_pct")
+    threshold = _auto_check_threshold()
+    primary_below_threshold = primary_remaining is None or primary_remaining < threshold
 
-    # 先保证 5h 已恢复的号排前；同一组内优先使用周额度更充足、5h 更充足的号。
+    # 先保证额度已恢复的号排前；同一组内优先使用周额度更充足、5h 更充足的号。
     # 缺少额度快照的旧记录保留可用性，但排在有明确快照的候选之后。
     return (
         not recovered,
         0 if recovered else float(resets_at or 9999999999),
+        primary_below_threshold,
         weekly_remaining is None,
         -(weekly_remaining if weekly_remaining is not None else 0),
         primary_remaining is None,
@@ -333,7 +377,11 @@ def get_standby_accounts():
             continue
         if a["status"] == STATUS_STANDBY:
             resets_at = a.get("quota_resets_at")
-            if resets_at is None:
+            quota_recovered = _quota_snapshot_recovered(a, now)
+            if quota_recovered is not None:
+                # last_quota 是更具体的事实:有明确剩余额度时不能继续被旧 quota_resets_at 卡住。
+                a["_quota_recovered"] = quota_recovered
+            elif resets_at is None:
                 # 没有恢复时间 = 不是因为额度用完被移出的，随时可复用
                 a["_quota_recovered"] = True
             else:
