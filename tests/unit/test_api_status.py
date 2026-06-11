@@ -293,6 +293,13 @@ def test_auto_check_cooldown_keeps_full_team_from_refilling(tmp_path, monkeypatc
     assert started == []
 
 
+def test_auto_check_burn_guard_defaults_are_not_overly_strict():
+    assert config.AUTO_CHECK_BURN_GUARD_ENABLED is True
+    assert config.AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS == 3600
+    assert config.AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED == 4
+    assert config.AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS == 300
+
+
 def test_auto_check_burn_guard_detects_cluster_from_state_log(tmp_path, monkeypatch):
     state_log = tmp_path / "state_log.jsonl"
     state_log.write_text(

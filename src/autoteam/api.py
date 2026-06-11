@@ -4567,7 +4567,8 @@ def _auto_check_loop():
             if burn_guard.get("blocked"):
                 logger.warning(
                     "[巡检] 烧号熔断已生效: 最近 %d 秒内 %d 个子号耗尽(%s)，"
-                    "暂停自动补位/替换 %d 秒；手动操作不受影响",
+                    "暂停自动补位/替换 %d 秒；手动操作不受影响。"
+                    "请检查任务并发、reasoning effort 和 service_tier/fast 设置",
                     burn_guard.get("window_seconds"),
                     burn_guard.get("count"),
                     ", ".join(burn_guard.get("emails") or []),

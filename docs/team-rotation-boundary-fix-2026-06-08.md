@@ -360,14 +360,15 @@ yunB active -> 5h 耗尽
 ```text
 AUTO_CHECK_BURN_GUARD_ENABLED=true
 AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS=3600
-AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED=2
-AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS=14400
+AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED=4
+AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS=300
 ```
 
 默认含义:
 
-- 1 小时内如果有 2 个不同子号从 `active` 进入 `exhausted`,认为当前任务强度异常。
-- 触发后 4 小时内暂停后台自动补位、自动替换、预防性 auto-rotate。
+- 1 小时内如果有 4 个不同子号从 `active` 进入 `exhausted`,认为当前任务强度异常。
+- 触发后 5 分钟内暂停后台自动补位、自动替换、预防性 auto-rotate。
+- 触发日志会提示用户检查任务并发、reasoning effort 和 service_tier/fast 设置。
 - 手动 `rotate/fill/cleanup` 不受限制。
 - Team 超员 / stale invite 清理不受限制,因为清理不会消耗新号额度。
 
@@ -447,14 +448,14 @@ git -C AutoTeam-F diff --check
 
 - 不建议同时跑多个 `xhigh + priority/fast`。
 - 需要保池时,把任务降到普通推理档位或减少并发。
-- 如果熔断触发,先让 5h 窗口自然恢复,不要手动连续补位。
+- 如果熔断触发,先检查任务强度,不要马上继续堆多个高强度任务。
 - 如果确实要强行继续消耗池子,可以手动执行 rotate/fill;这属于人工决策,不会被熔断拦截。
 
-如果确认自己的工作负载可以接受更激进的自动补位,再调整:
+如果确认自己的工作负载需要更保守的保护,再调整:
 
 ```text
 AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED=3
-AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS=7200
+AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS=1800
 ```
 
 不建议关闭:
