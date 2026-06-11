@@ -3,7 +3,7 @@ import logging
 import threading
 import time
 
-from autoteam import accounts, api, config
+from autoteam import account_state, accounts, api, config
 
 
 def test_get_status_normalizes_main_account_status_from_saved_auth(tmp_path, monkeypatch):
@@ -291,6 +291,147 @@ def test_auto_check_cooldown_keeps_full_team_from_refilling(tmp_path, monkeypatc
 
     assert probed
     assert started == []
+
+
+def test_auto_check_burn_guard_detects_cluster_from_state_log(tmp_path, monkeypatch):
+    state_log = tmp_path / "state_log.jsonl"
+    state_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "email": "one@example.com",
+                        "from_state": "active",
+                        "to_state": "exhausted",
+                        "timestamp": 950,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "email": "two@example.com",
+                        "from_state": "active",
+                        "to_state": "exhausted",
+                        "timestamp": 980,
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(account_state, "DEFAULT_LOG_PATH", state_log)
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api, "_DEFAULT_BURN_GUARD_ENABLED", True)
+    monkeypatch.setattr(api, "_DEFAULT_BURN_GUARD_WINDOW_SECONDS", 120)
+    monkeypatch.setattr(api, "_DEFAULT_BURN_GUARD_MAX_EXHAUSTED", 2)
+    monkeypatch.setattr(api, "_DEFAULT_BURN_GUARD_COOLDOWN_SECONDS", 600)
+
+    status = api._auto_check_burn_guard_status([], now=1_000)
+
+    assert status["blocked"] is True
+    assert status["count"] == 2
+    assert status["emails"] == ["one@example.com", "two@example.com"]
+    assert status["remaining_seconds"] == 580
+
+
+def test_auto_check_burn_guard_blocks_auto_fill(tmp_path, monkeypatch, caplog):
+    auth_file = tmp_path / "active.json"
+    auth_file.write_text(json.dumps({"access_token": "token"}), encoding="utf-8")
+    started = []
+
+    monkeypatch.setattr(api, "_auto_fill_last_trigger_ts", 0.0)
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr("autoteam.sync_targets.is_sync_target_enabled", lambda _target: False)
+    monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(api, "_start_task", lambda *args, **kwargs: started.append((args, kwargs)))
+    monkeypatch.setattr(
+        api,
+        "_auto_check_burn_guard_status",
+        lambda _accounts: {
+            "blocked": True,
+            "window_seconds": 3600,
+            "count": 2,
+            "emails": ["old-one@example.com", "old-two@example.com"],
+            "remaining_seconds": 300,
+        },
+    )
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "active@example.com", "status": "active", "auth_file": str(auth_file)}],
+    )
+
+    stop_event = threading.Event()
+    restart_event = threading.Event()
+    wait_calls = {"count": 0}
+
+    def fake_wait(_seconds):
+        wait_calls["count"] += 1
+        return wait_calls["count"] > 1
+
+    monkeypatch.setattr(stop_event, "wait", fake_wait)
+    monkeypatch.setattr(api, "_auto_check_stop", stop_event)
+    monkeypatch.setattr(api, "_auto_check_restart", restart_event)
+
+    with caplog.at_level(logging.WARNING):
+        api._auto_check_loop()
+
+    assert started == []
+    assert "烧号熔断中，本轮跳过 auto-fill" in caplog.text
+
+
+def test_auto_check_burn_guard_blocks_auto_replace_after_marking_exhausted(tmp_path, monkeypatch, caplog):
+    auth_file = tmp_path / "active.json"
+    auth_file.write_text(json.dumps({"access_token": "token"}), encoding="utf-8")
+    started = []
+    updates = []
+
+    monkeypatch.setattr(api, "_auto_fill_last_trigger_ts", 0.0)
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 2, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr("autoteam.sync_targets.is_sync_target_enabled", lambda _target: False)
+    monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(api, "_start_task", lambda *args, **kwargs: started.append((args, kwargs)))
+    monkeypatch.setattr(
+        api,
+        "_auto_check_burn_guard_status",
+        lambda _accounts: {
+            "blocked": True,
+            "window_seconds": 3600,
+            "count": 2,
+            "emails": ["old-one@example.com", "old-two@example.com"],
+            "recent_window_emails": ["old-one@example.com", "old-two@example.com"],
+            "remaining_seconds": 300,
+        },
+    )
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "active@example.com", "status": "active", "auth_file": str(auth_file)}],
+    )
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", lambda _token: ("exhausted", {}))
+    monkeypatch.setattr("autoteam.accounts.update_account", lambda email, **fields: updates.append((email, fields)))
+
+    stop_event = threading.Event()
+    restart_event = threading.Event()
+    wait_calls = {"count": 0}
+
+    def fake_wait(_seconds):
+        wait_calls["count"] += 1
+        return wait_calls["count"] > 1
+
+    monkeypatch.setattr(stop_event, "wait", fake_wait)
+    monkeypatch.setattr(api, "_auto_check_stop", stop_event)
+    monkeypatch.setattr(api, "_auto_check_restart", restart_event)
+
+    with caplog.at_level(logging.WARNING):
+        api._auto_check_loop()
+
+    assert started == []
+    assert updates and updates[0][0] == "active@example.com"
+    assert updates[0][1]["status"] == accounts.STATUS_EXHAUSTED
+    assert "烧号熔断阻止 auto-replace" in caplog.text
 
 
 def test_auto_check_team_member_count_carries_invites_and_occupancy(monkeypatch):

@@ -88,6 +88,14 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on", "y", "t")
 
 
+# 自动巡检烧号熔断:短时间内多个子号从 active 进入 exhausted 时,暂停自动补位/替换。
+# 这只限制后台自动巡检,不限制手动 rotate/fill/cleanup。
+AUTO_CHECK_BURN_GUARD_ENABLED = _get_bool_env("AUTO_CHECK_BURN_GUARD_ENABLED", True)
+AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS = max(60, _get_int_env("AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS", 3600))
+AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED = max(1, _get_int_env("AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED", 2))
+AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS = max(60, _get_int_env("AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS", 14400))
+
+
 # Sub2API target sync configuration. Empty required fields keep the target
 # disabled until explicitly configured.
 SUB2API_URL = os.environ.get("SUB2API_URL", "")

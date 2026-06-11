@@ -4136,6 +4136,18 @@ from autoteam.config import (
 from autoteam.config import (
     AUTO_CHECK_THRESHOLD as _DEFAULT_THRESHOLD,
 )
+from autoteam.config import (
+    AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS as _DEFAULT_BURN_GUARD_COOLDOWN_SECONDS,
+)
+from autoteam.config import (
+    AUTO_CHECK_BURN_GUARD_ENABLED as _DEFAULT_BURN_GUARD_ENABLED,
+)
+from autoteam.config import (
+    AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED as _DEFAULT_BURN_GUARD_MAX_EXHAUSTED,
+)
+from autoteam.config import (
+    AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS as _DEFAULT_BURN_GUARD_WINDOW_SECONDS,
+)
 
 # 运行时可修改的巡检配置
 _auto_check_config = {
@@ -4159,6 +4171,103 @@ def _resolve_auto_check_target_seats(cfg: dict[str, int | bool]) -> int:
 # 风控系统冷却时间。0 表示从未触发过。
 _auto_fill_last_trigger_ts = 0.0
 _AUTO_FILL_COOLDOWN_SECONDS = 1800  # 30 min
+
+
+def _collect_recent_quota_exhaustions(accounts: list[dict], *, now: float, lookback_seconds: int) -> list[dict]:
+    cutoff = now - max(1, int(lookback_seconds))
+    events: list[dict] = []
+
+    try:
+        from autoteam.account_state import DEFAULT_LOG_PATH
+
+        path = Path(DEFAULT_LOG_PATH)
+        if path.exists():
+            for line in read_text(path).splitlines():
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if row.get("from_state") != "active" or row.get("to_state") != "exhausted":
+                    continue
+                email = str(row.get("email") or "")
+                if not email or _is_main_account_email(email):
+                    continue
+                try:
+                    ts = float(row.get("timestamp") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts >= cutoff:
+                    events.append({"email": email, "timestamp": ts, "source": "state_log"})
+    except Exception as exc:
+        logger.warning("[巡检] 烧号熔断读取 state_log 失败: %s", exc)
+
+    if events:
+        return sorted(events, key=lambda item: item["timestamp"])
+
+    # 降级兜底:如果 state_log 不可读/为空,用 accounts.json 当前字段判断。
+    for acc in accounts:
+        email = str(acc.get("email") or "")
+        if not email or _is_main_account_email(email):
+            continue
+        try:
+            ts = float(acc.get("quota_exhausted_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts >= cutoff:
+            events.append({"email": email, "timestamp": ts, "source": "accounts"})
+    return sorted(events, key=lambda item: item["timestamp"])
+
+
+def _auto_check_burn_guard_status(accounts: list[dict], *, now: float | None = None) -> dict:
+    if not _DEFAULT_BURN_GUARD_ENABLED:
+        return {"blocked": False, "enabled": False}
+
+    now_ts = time.time() if now is None else float(now)
+    window = int(_DEFAULT_BURN_GUARD_WINDOW_SECONDS)
+    max_exhausted = int(_DEFAULT_BURN_GUARD_MAX_EXHAUSTED)
+    cooldown = int(_DEFAULT_BURN_GUARD_COOLDOWN_SECONDS)
+    lookback = max(window, cooldown)
+    events = _collect_recent_quota_exhaustions(accounts, now=now_ts, lookback_seconds=lookback)
+    recent_window_emails = sorted(
+        {
+            str(item["email"])
+            for item in events
+            if float(item["timestamp"]) >= now_ts - window
+        }
+    )
+
+    trip_at = 0.0
+    trip_emails: list[str] = []
+    for idx, event in enumerate(events):
+        event_ts = float(event["timestamp"])
+        cluster_start = event_ts - window
+        cluster = [
+            item for item in events[: idx + 1]
+            if cluster_start <= float(item["timestamp"]) <= event_ts
+        ]
+        unique_emails = sorted({str(item["email"]) for item in cluster})
+        if len(unique_emails) >= max_exhausted:
+            trip_at = event_ts
+            trip_emails = unique_emails
+
+    blocked_until = trip_at + cooldown if trip_at else 0.0
+    blocked = bool(blocked_until and blocked_until > now_ts)
+    return {
+        "blocked": blocked,
+        "enabled": True,
+        "count": len(trip_emails),
+        "emails": trip_emails,
+        "recent_window_count": len(recent_window_emails),
+        "recent_window_emails": recent_window_emails,
+        "tripped_at": trip_at or None,
+        "blocked_until": blocked_until if blocked else None,
+        "remaining_seconds": max(0, int(blocked_until - now_ts)) if blocked else 0,
+        "window_seconds": window,
+        "max_exhausted": max_exhausted,
+        "cooldown_seconds": cooldown,
+    }
 
 
 def _playwright_probe_command(*args: str) -> list[str]:
@@ -4454,6 +4563,16 @@ def _auto_check_loop():
             actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
             actual_invite_count = _team_member_invite_count(actual_team_count)
             actual_team_occupancy = _team_member_occupancy(actual_team_count)
+            burn_guard = _auto_check_burn_guard_status(accounts)
+            if burn_guard.get("blocked"):
+                logger.warning(
+                    "[巡检] 烧号熔断已生效: 最近 %d 秒内 %d 个子号耗尽(%s)，"
+                    "暂停自动补位/替换 %d 秒；手动操作不受影响",
+                    burn_guard.get("window_seconds"),
+                    burn_guard.get("count"),
+                    ", ".join(burn_guard.get("emails") or []),
+                    burn_guard.get("remaining_seconds"),
+                )
 
             if actual_team_occupancy > target_seats:
                 if not _playwright_lock.acquire(blocking=False):
@@ -4623,6 +4742,13 @@ def _auto_check_loop():
                     should_start_auto_fill = True
 
                 if should_start_auto_fill:
+                    if burn_guard.get("blocked"):
+                        logger.warning(
+                            "[巡检] active=%d < %d 但烧号熔断中，本轮跳过 auto-fill",
+                            len(active),
+                            sub_account_target,
+                        )
+                        continue
                     if not _playwright_lock.acquire(blocking=False):
                         logger.info(
                             "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",
@@ -4723,7 +4849,18 @@ def _auto_check_loop():
 
                 # 失效一个立即轮换一个:逐个 kick+补一个,不等凑 min_low 也不走全量 cmd_rotate。
                 # min_low 字段保留作兼容(当前不参与判断),前端可继续配置但无语义效果。
-                logger.info("[巡检] 触发即时替换 (%d 个)...", len(emails_to_replace))
+                logger.info("[巡检] 准备即时替换 (%d 个)...", len(emails_to_replace))
+                recent_burn_emails = set(burn_guard.get("recent_window_emails") or [])
+                next_burn_emails = recent_burn_emails | set(emails_to_replace)
+                if burn_guard.get("blocked") or len(next_burn_emails) >= int(_DEFAULT_BURN_GUARD_MAX_EXHAUSTED):
+                    logger.warning(
+                        "[巡检] 烧号熔断阻止 auto-replace: 最近窗口内将达到 %d/%d 个耗尽子号(%s)，"
+                        "本轮只标记耗尽，不自动补新号",
+                        len(next_burn_emails),
+                        int(_DEFAULT_BURN_GUARD_MAX_EXHAUSTED),
+                        ", ".join(sorted(next_burn_emails)),
+                    )
+                    continue
                 from autoteam.manager import cmd_replace_batch
 
                 try:
@@ -4747,6 +4884,9 @@ def _auto_check_loop():
                     logger.info("[巡检] CPA/CLIProxy provider-auth 低水位，但有任务在跑，本轮跳过预防性轮转")
                     continue
                 _playwright_lock.release()
+                if burn_guard.get("blocked"):
+                    logger.warning("[巡检] CPA/CLIProxy provider-auth 低水位，但烧号熔断中，本轮跳过 auto-rotate")
+                    continue
 
                 logger.warning(
                     "[巡检] CPA/CLIProxy provider-auth 可用凭证低水位: "
