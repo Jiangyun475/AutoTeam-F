@@ -106,8 +106,8 @@ def test_reconcile_status_drift_local_standby_workspace_active(tmp_path, monkeyp
     assert any(kw.get("status") == STATUS_ACTIVE for _email, kw in updates)
 
 
-def test_reconcile_marks_exhausted_when_quota_zero(tmp_path, monkeypatch):
-    """workspace=active + 本地=active + auth_file 有 + last_quota 5h/周均 100% → 标 EXHAUSTED,**不 KICK**。"""
+def test_reconcile_does_not_mark_exhausted_from_historical_quota(tmp_path, monkeypatch):
+    """workspace=active + last_quota 100/100 不能直接标 EXHAUSTED；必须等实时 quota 复查。"""
     auth_path = tmp_path / "codex-eaten@example.com.json"
     auth_path.write_text("{}", encoding="utf-8")
 
@@ -130,9 +130,8 @@ def test_reconcile_marks_exhausted_when_quota_zero(tmp_path, monkeypatch):
 
     result = manager._reconcile_team_members(chatgpt_api=fake)
 
-    assert "eaten@example.com" in result["exhausted_marked"]
-    # 必须带 status=EXHAUSTED 且写 quota_exhausted_at
-    assert any(kw.get("status") == STATUS_EXHAUSTED and kw.get("quota_exhausted_at") is not None for _e, kw in updates)
+    assert "eaten@example.com" not in result["exhausted_marked"]
+    assert not any(kw.get("status") == STATUS_EXHAUSTED for _e, kw in updates)
 
 
 def test_reconcile_dry_run_does_not_mutate(tmp_path, monkeypatch):
@@ -405,14 +404,11 @@ def test_reconcile_misaligned_with_auth_repair_still_checks_exhausted(tmp_path, 
 
     # misaligned_fixed 命中
     assert "rescued@example.com" in result["misaligned_fixed"]
-    # **关键回归断言**:fallthrough 后 exhausted_marked 也命中
-    assert "rescued@example.com" in result["exhausted_marked"], (
-        f"补 auth 后必须 fallthrough 到 quota 检查,实际 result={result}"
+    # 新边界:补 auth 后也不能用历史 last_quota 直接判 exhausted。
+    assert "rescued@example.com" not in result["exhausted_marked"], (
+        f"补 auth 后必须等待实时 quota 复查,实际 result={result}"
     )
-    # 必须有一次 update 把 status 改成 EXHAUSTED 且写 quota_exhausted_at
-    assert any(
-        kw.get("status") == STATUS_EXHAUSTED and kw.get("quota_exhausted_at") is not None for _e, kw in updates
-    ), f"missing EXHAUSTED+quota_exhausted_at update: {updates}"
+    assert not any(kw.get("status") == STATUS_EXHAUSTED for _e, kw in updates)
 
 
 def test_reconcile_misaligned_orphan_kick_syncs_status_to_auth_invalid(tmp_path, monkeypatch):

@@ -1305,22 +1305,50 @@ def _quota_blocking_window(
     return "", None
 
 
+def _account_standby_since(acc: dict) -> float:
+    for key in ("standby_since", "quota_exhausted_at", "last_active_at", "created_at"):
+        value = acc.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return 0.0
+
+
+def _account_cooldown_until(acc: dict) -> float | None:
+    for key in ("quota_cooldown_until", "quota_resets_at"):
+        value = acc.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return None
+
+
 def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dict:
     raw_status = str(acc.get("status") or "")
     now = time.time()
-    quota_info = quota_snapshot if isinstance(quota_snapshot, dict) else acc.get("last_quota")
+    standby_like = raw_status in ("standby", "exhausted")
+    if (
+        standby_like
+        and isinstance(acc.get("standby_quota_snapshot"), dict)
+        and isinstance(acc.get("quota_snapshot_recorded_at"), (int, float))
+    ):
+        quota_info = acc.get("standby_quota_snapshot")
+        quota_scope = "standby_snapshot"
+    elif isinstance(quota_snapshot, dict) and not standby_like:
+        quota_info = quota_snapshot
+        quota_scope = "live"
+    else:
+        quota_info = None if standby_like else acc.get("last_quota")
+        quota_scope = "standby_snapshot" if standby_like else "live"
     primary_pct = _quota_int(quota_info, "primary_pct")
     weekly_pct = _quota_int(quota_info, "weekly_pct")
     primary_remaining_pct = max(0, min(100, 100 - primary_pct)) if primary_pct is not None else None
     weekly_remaining_pct = max(0, min(100, 100 - weekly_pct)) if weekly_pct is not None else None
     primary_resets_at = _quota_ts(quota_info, "primary_resets_at")
     weekly_resets_at = _quota_ts(quota_info, "weekly_resets_at")
-    quota_resets_at = acc.get("quota_resets_at")
-    if not isinstance(quota_resets_at, (int, float)) or quota_resets_at <= 0:
-        quota_resets_at = None
+    quota_resets_at = _account_cooldown_until(acc)
     auth_retry_after = acc.get("auth_retry_after")
     if not isinstance(auth_retry_after, (int, float)) or auth_retry_after <= 0:
         auth_retry_after = None
+    standby_since = _account_standby_since(acc)
 
     try:
         from autoteam.config import AUTO_CHECK_THRESHOLD
@@ -1344,7 +1372,7 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
         bucket = 10
         next_usable_at = primary_resets_at
         reason = "active_5h_reset"
-    elif raw_status in ("standby", "exhausted"):
+    elif standby_like:
         quota_block_reason, quota_block_until = _quota_blocking_window(
             primary_remaining_pct=primary_remaining_pct,
             weekly_remaining_pct=weekly_remaining_pct,
@@ -1356,18 +1384,14 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
             bucket = 45
             next_usable_at = auth_retry_after
             reason = "auth_retry_after"
-        elif quota_block_reason:
-            bucket = 55 if quota_block_reason == "weekly_exhausted" else 40
-            next_usable_at = quota_block_until or quota_resets_at
-            reason = quota_block_reason
-        elif primary_remaining_pct is not None and primary_remaining_pct < quota_threshold:
-            bucket = 35
-            next_usable_at = primary_resets_at
-            reason = "primary_low"
-        elif quota_resets_at and quota_resets_at > now and primary_remaining_pct is None:
+        elif quota_resets_at and quota_resets_at > now:
             bucket = 40
             next_usable_at = quota_resets_at
-            reason = "quota_resets_at"
+            reason = "quota_cooldown"
+        elif quota_block_reason == "weekly_exhausted":
+            bucket = 55
+            next_usable_at = quota_block_until
+            reason = quota_block_reason
         else:
             bucket = 20
             next_usable_at = None
@@ -1386,14 +1410,22 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
         else:
             reason = raw_status
 
-    if primary_remaining_pct is not None:
-        detail_parts.append(f"5h剩余 {primary_remaining_pct}%")
-    if weekly_remaining_pct is not None:
-        detail_parts.append(f"周剩余 {weekly_remaining_pct}%")
-    if reason == "primary_low":
-        detail_parts.append(f"5h低于阈值 {quota_threshold}%")
-    if reason == "quota_resets_at" and quota_resets_at and quota_resets_at > now:
-        detail_parts.append(f"复用冷却 {_format_pool_wait(quota_resets_at - now)}")
+    if standby_like:
+        if reason == "quota_cooldown" and quota_resets_at and quota_resets_at > now:
+            detail_parts.append(f"冷却中 {_format_pool_wait(quota_resets_at - now)}")
+        elif reason == "auth_retry_after" and auth_retry_after and auth_retry_after > now:
+            detail_parts.append(f"登录重试 {_format_pool_wait(auth_retry_after - now)}")
+        elif reason == "weekly_exhausted":
+            detail_parts.append("周额度耗尽")
+        elif reason == "ready_now":
+            detail_parts.append("可复用")
+    else:
+        if primary_remaining_pct is not None:
+            detail_parts.append(f"5h剩余 {primary_remaining_pct}%")
+        if weekly_remaining_pct is not None:
+            detail_parts.append(f"周剩余 {weekly_remaining_pct}%")
+        if reason == "primary_low":
+            detail_parts.append(f"5h低于阈值 {quota_threshold}%")
     if reason == "ready_low_weekly":
         detail_parts.append("周额度偏低,有其它号时会靠后")
 
@@ -1407,6 +1439,8 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
         "weekly_remaining_pct": weekly_remaining_pct,
         "primary_resets_at": primary_resets_at,
         "weekly_resets_at": weekly_resets_at,
+        "quota_display_scope": quota_scope,
+        "standby_since": standby_since,
         "pool_rank_detail": " · ".join(detail_parts),
     }
 
@@ -1430,12 +1464,18 @@ def _account_pool_sort_key(acc: dict) -> tuple:
     weekly_missing = not isinstance(weekly_remaining, (int, float))
     if weekly_missing:
         weekly_remaining = 0
+    standby_since = schedule.get("standby_since")
+    if not isinstance(standby_since, (int, float)) or standby_since <= 0:
+        standby_since = acc.get("created_at") or 0
+    if not isinstance(standby_since, (int, float)):
+        standby_since = 0
     created_at = acc.get("created_at")
     if not isinstance(created_at, (int, float)):
         created_at = 0
     return (
         int(bucket),
         float(next_usable_at),
+        float(standby_since) if int(bucket) in (20, 40, 45, 55) else 0.0,
         weekly_missing,
         -int(weekly_remaining),
         primary_missing,
@@ -1463,6 +1503,8 @@ def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
     sanitized["next_usable_reason"] = schedule["next_usable_reason"]
     sanitized["primary_remaining_pct"] = schedule["primary_remaining_pct"]
     sanitized["weekly_remaining_pct"] = schedule["weekly_remaining_pct"]
+    sanitized["quota_display_scope"] = schedule["quota_display_scope"]
+    sanitized["standby_since"] = schedule["standby_since"]
     sanitized["pool_rank_detail"] = schedule["pool_rank_detail"]
     return sanitized
 
@@ -3210,14 +3252,17 @@ def post_account_login(params: LoginAccountParams):
                     if st == "ok" and isinstance(info, dict):
                         update_account(email, last_quota=info)
                     elif st == "exhausted":
+                        from autoteam.manager import _quota_exhaustion_fields
+
                         quota_info = quota_result_quota_info(info)
-                        if quota_info:
-                            update_account(email, last_quota=quota_info)
                         update_account(
                             email,
                             status="exhausted",
-                            quota_exhausted_at=time.time(),
-                            quota_resets_at=quota_result_resets_at(info) or int(time.time() + 18000),
+                            **_quota_exhaustion_fields(
+                                quota_info,
+                                quota_result_resets_at(info) or int(time.time() + 18000),
+                                "api_oauth_quota_exhausted",
+                            ),
                         )
             # 同步到 CPA
             from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
@@ -4712,7 +4757,7 @@ def _cpa_provider_auth_below_pool_target(gate: dict | None, pool_target: int) ->
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
-    from autoteam.codex_auth import check_codex_quota
+    from autoteam.codex_auth import check_codex_quota, quota_result_quota_info
 
     while not _auto_check_stop.is_set():
         cfg = _auto_check_config
@@ -5045,15 +5090,18 @@ def _auto_check_loop():
                     if status == "ok" and isinstance(info, dict):
                         remaining = 100 - info.get("primary_pct", 0)
                         if remaining < cfg["threshold"]:
-                            low_accounts.append((acc["email"], remaining))
+                            low_accounts.append((acc["email"], remaining, info))
                     elif status == "exhausted":
-                        low_accounts.append((acc["email"], 0))
+                        quota_info = quota_result_quota_info(info) if isinstance(info, dict) else None
+                        low_accounts.append((acc["email"], 0, quota_info or {}))
                 except Exception:
                     pass
 
             if low_accounts:
                 logger.info(
-                    "[巡检] %d 个账号额度不足: %s", len(low_accounts), ", ".join(f"{e}({r}%)" for e, r in low_accounts)
+                    "[巡检] %d 个账号额度不足: %s",
+                    len(low_accounts),
+                    ", ".join(f"{e}({r}%)" for e, r, _quota in low_accounts),
                 )
 
                 # 有任务在跑则本轮跳过(下轮再替换,避免重复 kick)
@@ -5068,16 +5116,24 @@ def _auto_check_loop():
                 # 反复 reinvite 进 Team,席位来回洗同一批耗尽账号永远不换新鲜的。
                 # 阈值默认 5h(18000s),与 check_codex_quota 无返回 resets_at 时的 fallback 一致。
                 from autoteam.accounts import STATUS_EXHAUSTED, update_account
+                from autoteam.manager import _quota_exhaustion_fields
 
                 now_ts = time.time()
                 emails_to_replace = []
-                for email, remaining in low_accounts:
+                for email, remaining, quota_info in low_accounts:
                     logger.info("[巡检] %s 剩余 %d%%，立即替换", email, remaining)
+                    resets_at = None
+                    if isinstance(quota_info, dict):
+                        resets_at = quota_info.get("primary_resets_at")
                     update_account(
                         email,
                         status=STATUS_EXHAUSTED,
-                        quota_exhausted_at=now_ts,
-                        quota_resets_at=now_ts + 18000,
+                        **_quota_exhaustion_fields(
+                            quota_info,
+                            resets_at or now_ts + 18000,
+                            "auto_check_low_quota",
+                            now_ts=now_ts,
+                        ),
                     )
                     emails_to_replace.append(email)
 

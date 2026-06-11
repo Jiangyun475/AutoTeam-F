@@ -304,9 +304,17 @@ def _quota_ts(acc: dict, key: str) -> float | None:
 
 
 def _quota_snapshot_recovered(acc: dict, now: float) -> bool | None:
-    """Return recovered decision from last_quota, or None when no useful snapshot exists."""
+    """Return only blocking decisions from last_quota.
+
+    Standby reuse is driven by the explicit cooldown fields below.  A stale
+    last_quota snapshot must never unlock an account early; it can only keep an
+    account waiting when no cooldown was recorded and the snapshot still proves
+    quota exhaustion.
+    """
     quota = acc.get("last_quota") if isinstance(acc.get("last_quota"), dict) else {}
     if not quota:
+        return None
+    if acc.get("status") == STATUS_STANDBY and not isinstance(acc.get("quota_snapshot_recorded_at"), (int, float)):
         return None
 
     primary = _quota_remaining_pct(acc, "primary_pct")
@@ -324,7 +332,23 @@ def _quota_snapshot_recovered(acc: dict, now: float) -> bool | None:
     if weekly is not None and weekly <= 0 and (not weekly_reset or weekly_reset > now):
         return False
 
-    return True
+    return None
+
+
+def _standby_cooldown_until(acc: dict) -> float | None:
+    for key in ("quota_cooldown_until", "quota_resets_at"):
+        value = acc.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return None
+
+
+def _standby_since(acc: dict) -> float:
+    for key in ("standby_since", "quota_exhausted_at", "last_active_at", "created_at"):
+        value = acc.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return 0.0
 
 
 def _auto_check_threshold() -> int:
@@ -338,29 +362,15 @@ def _auto_check_threshold() -> int:
 
 def _standby_sort_key(acc: dict) -> tuple:
     recovered = bool(acc.get("_quota_recovered", False))
-    resets_at = acc.get("quota_resets_at")
-    if not isinstance(resets_at, (int, float)) or resets_at <= 0:
-        resets_at = 0
-    exhausted_at = acc.get("quota_exhausted_at")
-    if not isinstance(exhausted_at, (int, float)) or exhausted_at <= 0:
-        exhausted_at = 0
+    cooldown_until = _standby_cooldown_until(acc)
+    standby_since = _standby_since(acc)
 
-    primary_remaining = _quota_remaining_pct(acc, "primary_pct")
-    weekly_remaining = _quota_remaining_pct(acc, "weekly_pct")
-    threshold = _auto_check_threshold()
-    primary_below_threshold = primary_remaining is None or primary_remaining < threshold
-
-    # 先保证额度已恢复的号排前；同一组内优先使用周额度更充足、5h 更充足的号。
-    # 缺少额度快照的旧记录保留可用性，但排在有明确快照的候选之后。
+    # 先保证已出冷却的号排前；同一组内按进入 standby 队列的时间 FIFO。
+    # 不再按 last_quota 的周/5h 剩余排序,避免旧快照把刚踢出的账号排到前面。
     return (
         not recovered,
-        0 if recovered else float(resets_at or 9999999999),
-        primary_below_threshold,
-        weekly_remaining is None,
-        -(weekly_remaining if weekly_remaining is not None else 0),
-        primary_remaining is None,
-        -(primary_remaining if primary_remaining is not None else 0),
-        float(exhausted_at),
+        0 if recovered else float(cooldown_until or 9999999999),
+        float(standby_since),
         str(acc.get("email") or ""),
     )
 
@@ -376,19 +386,18 @@ def get_standby_accounts():
         if is_account_disabled(a):
             continue
         if a["status"] == STATUS_STANDBY:
-            resets_at = a.get("quota_resets_at")
-            quota_recovered = _quota_snapshot_recovered(a, now)
-            if quota_recovered is not None:
-                # last_quota 是更具体的事实:有明确剩余额度时不能继续被旧 quota_resets_at 卡住。
-                a["_quota_recovered"] = quota_recovered
-            elif resets_at is None:
-                # 没有恢复时间 = 不是因为额度用完被移出的，随时可复用
-                a["_quota_recovered"] = True
+            cooldown_until = _standby_cooldown_until(a)
+            if cooldown_until is not None:
+                a["_quota_recovered"] = now >= cooldown_until
             else:
-                # 有恢复时间，看是否已过
-                a["_quota_recovered"] = now >= resets_at
+                quota_recovered = _quota_snapshot_recovered(a, now)
+                if quota_recovered is not None:
+                    a["_quota_recovered"] = quota_recovered
+                # 没有恢复时间 = 不是因为额度用完被移出的，随时可复用
+                else:
+                    a["_quota_recovered"] = True
             standby.append(a)
-    # 已恢复的排前面；同为已恢复时优先周额度/5h 额度更健康的账号。
+    # 已恢复的排前面；同为已恢复时按进入 standby 的时间 FIFO。
     standby.sort(key=_standby_sort_key)
     return standby
 

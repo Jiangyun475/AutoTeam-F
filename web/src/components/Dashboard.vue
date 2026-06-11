@@ -116,9 +116,9 @@
               <th class="px-4 py-3 font-semibold">邮箱</th>
               <th class="px-4 py-3 font-semibold">状态</th>
               <th class="px-4 py-3 font-semibold">实际可用</th>
-              <th class="px-4 py-3 font-semibold text-right">5h 剩余</th>
-              <th class="px-4 py-3 font-semibold text-right">周 剩余</th>
-              <th class="px-4 py-3 font-semibold">5h 重置</th>
+              <th class="px-4 py-3 font-semibold text-right">5h 额度</th>
+              <th class="px-4 py-3 font-semibold text-right">周额度</th>
+              <th class="px-4 py-3 font-semibold">5h 时间</th>
               <th class="px-4 py-3 font-semibold">下次可用</th>
               <th class="px-4 py-3 font-semibold">周 重置</th>
               <th class="px-4 py-3 font-semibold text-right">操作</th>
@@ -511,19 +511,37 @@ const cards = computed(() => {
 })
 
 function quota(acc, type) {
-  const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
+  const qi = quotaInfo(acc)
   if (!qi) return null
   return _qr(qi, type)
 }
 function quotaPct(acc, type) {
-  const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
-  return quotaPctText(qi, type)
+  const qi = quotaInfo(acc)
+  const text = quotaPctText(qi, type)
+  if (text === '-') return text
+  if (quotaScope(acc) === 'standby_snapshot') return `离队 ${text}`
+  return text
 }
 function quotaReset(acc, type) {
-  const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
+  if (quotaScope(acc) === 'standby_snapshot' && type === 'primary') {
+    const ts = acc.quota_cooldown_until || acc.quota_resets_at
+    return ts ? formatPoolTime(ts) : '-'
+  }
+  const qi = quotaInfo(acc)
   return formatQuotaReset(qi, type)
 }
 function pctColor(remain) { return quotaPctColor(remain) }
+
+function quotaScope(acc) {
+  return acc.quota_display_scope || ((acc.status === 'standby' || acc.status === 'exhausted') ? 'standby_snapshot' : 'live')
+}
+
+function quotaInfo(acc) {
+  if (quotaScope(acc) === 'standby_snapshot') {
+    return acc.quota_snapshot_recorded_at ? acc.standby_quota_snapshot : null
+  }
+  return props.status?.quota_cache?.[acc.email] || acc.last_quota
+}
 
 function formatPoolTime(ts) {
   if (!ts) return '现在'
@@ -544,6 +562,7 @@ function nextUsableReason(acc) {
     ready_now: '已可复用',
     primary_low: '5h额度偏低',
     primary_exhausted: '5h额度耗尽',
+    quota_cooldown: '等冷却',
     ready_low_weekly: '周额度偏低',
     quota_resets_at: '等额度刷新',
     weekly_exhausted: '周额度耗尽',

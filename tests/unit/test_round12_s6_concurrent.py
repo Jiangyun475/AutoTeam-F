@@ -134,6 +134,30 @@ class TestReuseOneStandby:
         )
         assert result["result"] == "skipped_quota"
 
+    def test_explicit_cooldown_blocks_reinvite_even_when_old_snapshot_has_quota(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(manager_mod, "_auto_reuse_skip_reason", lambda acc: None)
+        auth_path = tmp_path / "auth.json"
+        auth_path.write_text('{"access_token":"X"}')
+        reinvite = MagicMock(return_value=True)
+
+        result = _reuse_one_standby(
+            {
+                "email": "a@x.com",
+                "auth_file": str(auth_path),
+                "quota_cooldown_until": 1_600,
+                "last_quota": {"primary_pct": 1, "primary_resets_at": 900, "weekly_pct": 30},
+            },
+            threshold=10,
+            chatgpt_provider=lambda: "FAKE_CHATGPT",
+            mail_provider=lambda acc: "FAKE_MAIL",
+            reinvite_fn=reinvite,
+            quota_fn=lambda token: ("ok", {"primary_pct": 5}),
+            now=1_000.0,
+        )
+
+        assert result["result"] == "skipped_quota"
+        reinvite.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 2. Concurrency observability (ThreadPoolExecutor really runs in parallel)

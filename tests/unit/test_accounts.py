@@ -98,7 +98,7 @@ def test_get_standby_accounts_orders_recovered_first_and_skips_main_account(tmp_
     assert accounts.get_next_reusable_account()["email"] == "always@example.com"
 
 
-def test_get_standby_accounts_prefers_weekly_then_primary_quota_within_recovered(tmp_path, monkeypatch):
+def test_get_standby_accounts_uses_fifo_within_recovered(tmp_path, monkeypatch):
     accounts_file = tmp_path / "accounts.json"
     monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
     monkeypatch.setattr(accounts, "get_admin_email", lambda: "owner@example.com")
@@ -139,9 +139,9 @@ def test_get_standby_accounts_prefers_weekly_then_primary_quota_within_recovered
     standby = accounts.get_standby_accounts()
 
     assert [item["email"] for item in standby] == [
-        "high-weekly-high-primary@example.com",
-        "high-weekly-low-primary@example.com",
         "low-weekly@example.com",
+        "high-weekly-low-primary@example.com",
+        "high-weekly-high-primary@example.com",
         "unknown-quota@example.com",
     ]
 
@@ -179,7 +179,7 @@ def test_get_standby_accounts_keeps_exhausted_waiting_after_recovered_even_with_
     assert standby[1]["_quota_recovered"] is False
 
 
-def test_get_standby_accounts_ignores_stale_reset_when_snapshot_has_quota(tmp_path, monkeypatch):
+def test_get_standby_accounts_does_not_let_stale_quota_unlock_cooldown(tmp_path, monkeypatch):
     accounts_file = tmp_path / "accounts.json"
     monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
     monkeypatch.setattr(accounts, "get_admin_email", lambda: "owner@example.com")
@@ -204,7 +204,7 @@ def test_get_standby_accounts_ignores_stale_reset_when_snapshot_has_quota(tmp_pa
     standby = accounts.get_standby_accounts()
 
     assert standby[0]["email"] == "stale-cooldown@example.com"
-    assert standby[0]["_quota_recovered"] is True
+    assert standby[0]["_quota_recovered"] is False
 
 
 def test_load_accounts_normalizes_disabled_field(tmp_path, monkeypatch):
