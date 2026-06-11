@@ -20,6 +20,20 @@ logger = logging.getLogger(__name__)
 _CPA_SESSION = requests.Session()
 _CPA_SESSION.trust_env = False
 
+_TRANSIENT_AUTH_REPAIR_ERRORS = {"exception", "login_failed", "site_unavailable"}
+_TRANSIENT_AUTH_REPAIR_DETAIL_MARKERS = (
+    "page.screenshot",
+    "timeout",
+    "timed out",
+    "net::",
+    "network",
+    "connection",
+    "proxy",
+    "temporarily unavailable",
+    "try again later",
+    "context deadline exceeded",
+)
+
 
 def _headers():
     return {"Authorization": f"Bearer {CPA_KEY}"}
@@ -220,8 +234,34 @@ def _refresh_account_proxy_url_for_upload(acc: dict, path: Path) -> None:
         logger.warning("[CPA] IPv6 proxy_url 刷新失败，继续上传原凭证: %s (%s)", email, exc)
 
 
+def _has_active_transient_auth_repair_error(acc: dict) -> bool:
+    """Avoid mutating CPA while an active account is in auth-repair cooldown."""
+    error_type = str(acc.get("auth_last_error") or "").strip()
+    detail = str(acc.get("auth_last_error_detail") or "").lower()
+    if error_type in _TRANSIENT_AUTH_REPAIR_ERRORS:
+        transient = True
+    elif error_type:
+        transient = False
+    else:
+        transient = any(marker in detail for marker in _TRANSIENT_AUTH_REPAIR_DETAIL_MARKERS)
+    if not transient:
+        return False
+    try:
+        retry_after = float(acc.get("auth_retry_after") or 0)
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    return bool(acc.get("auth_retry_paused") or retry_after > time.time())
+
+
 def _active_auth_publish_decision(acc: dict, path: Path) -> str:
     """Return publish/delete_remote/keep_remote for a local active Codex auth file."""
+    if _has_active_transient_auth_repair_error(acc):
+        logger.warning(
+            "[CPA] active 凭证处于临时 auth_repair 冷却，保留远端副本等待下轮: %s",
+            path.name,
+        )
+        return "keep_remote"
+
     if not path.exists():
         return "delete_remote"
 

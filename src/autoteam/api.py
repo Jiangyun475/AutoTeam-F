@@ -194,6 +194,12 @@ async def app_lifespan(app: FastAPI):
             ipv6_pool.stop_all()
         except Exception as exc:
             logger.warning("[lifespan] stopping IPv6 proxy pool failed: %s", exc)
+        try:
+            from autoteam.display import stop_virtual_display
+
+            stop_virtual_display()
+        except Exception as exc:
+            logger.warning("[lifespan] stopping virtual display failed: %s", exc)
 
 
 app = FastAPI(
@@ -1190,6 +1196,11 @@ class DeleteBatchParams(BaseModel):
 
 class AccountDisableParams(BaseModel):
     emails: list[str]
+
+
+class AuthRepairRecoverParams(BaseModel):
+    apply: bool = False
+    emails: list[str] = Field(default_factory=list)
 
 
 def _normalized_email(value: str | None) -> str:
@@ -3303,6 +3314,105 @@ def get_status(fast: bool = False):
     }
 
 
+def _is_auth_repair_misclassification_candidate(acc: dict) -> tuple[bool, str]:
+    from autoteam.accounts import STATUS_AUTH_INVALID
+
+    email = str(acc.get("email") or "").strip().lower()
+    if not email:
+        return False, "missing_email"
+    if _is_main_account_email(email):
+        return False, "main_account"
+    if acc.get("status") != STATUS_AUTH_INVALID:
+        return False, "status_not_auth_invalid"
+    if str(acc.get("auth_last_error") or "").strip() not in {"exception", "login_failed"}:
+        return False, "error_type_not_transient"
+    detail = str(acc.get("auth_last_error_detail") or "").lower()
+    if "page.screenshot" not in detail:
+        return False, "detail_not_screenshot_timeout"
+    auth_file = acc.get("auth_file")
+    if not auth_file:
+        return False, "missing_auth_file"
+    if not Path(auth_file).exists():
+        return False, "auth_file_not_found"
+    return True, "matched"
+
+
+def _auth_repair_recovery_candidates(accounts: list[dict], *, emails: list[str] | None = None) -> list[dict]:
+    selected = {_normalized_email(email) for email in (emails or []) if _normalized_email(email)}
+    rows = []
+    for acc in accounts:
+        email = _normalized_email(acc.get("email"))
+        if selected and email not in selected:
+            continue
+        matched, reason = _is_auth_repair_misclassification_candidate(acc)
+        if not matched:
+            continue
+        rows.append(
+            {
+                "email": email,
+                "status": acc.get("status"),
+                "auth_last_error": acc.get("auth_last_error"),
+                "auth_last_error_detail": acc.get("auth_last_error_detail"),
+                "auth_file": acc.get("auth_file"),
+                "reason": reason,
+            }
+        )
+    return rows
+
+
+@app.get("/api/auth-repair/recovery-candidates")
+def get_auth_repair_recovery_candidates():
+    """只读列出被 auth_repair 临时异常误标 auth_invalid 的候选账号。"""
+    from autoteam.accounts import load_accounts
+
+    candidates = _auth_repair_recovery_candidates(load_accounts())
+    return {
+        "candidates": candidates,
+        "count": len(candidates),
+        "criteria": {
+            "status": "auth_invalid",
+            "auth_last_error": ["exception", "login_failed"],
+            "auth_last_error_detail_contains": "Page.screenshot",
+            "auth_file_exists": True,
+            "exclude_main_account": True,
+        },
+    }
+
+
+@app.post("/api/auth-repair/recover-misclassified")
+def post_auth_repair_recover_misclassified(params: AuthRepairRecoverParams):
+    """恢复精确匹配的误伤账号；默认 dry-run，apply=true 才写回 standby。"""
+    from autoteam.accounts import STATUS_STANDBY, load_accounts, update_account
+
+    accounts = load_accounts()
+    candidates = _auth_repair_recovery_candidates(accounts, emails=params.emails)
+    restored = []
+    if params.apply:
+        for item in candidates:
+            email = item["email"]
+            update_account(
+                email,
+                status=STATUS_STANDBY,
+                auth_retry_count=0,
+                auth_last_error=None,
+                auth_last_error_detail=None,
+                auth_last_failed_at=None,
+                auth_retry_after=None,
+                auth_retry_paused=False,
+                _reason="recover_auth_repair_misclassification",
+            )
+            restored.append(email)
+
+    return {
+        "apply": params.apply,
+        "candidates": candidates,
+        "candidate_count": len(candidates),
+        "restored": restored,
+        "restored_count": len(restored),
+        "next_step": "run read-only quota/auth probe before publishing to CPA" if restored else "dry-run only",
+    }
+
+
 @app.post("/api/sync")
 def post_sync():
     """同步认证文件到 CPA"""
@@ -3794,7 +3904,7 @@ def post_rotate(params: TaskParams = TaskParams()):
 
     task = _start_task(
         "rotate",
-        lambda target: cmd_rotate(target, force_auth_repair=True, background_post_sync=True),
+        lambda target: cmd_rotate(target, force_auth_repair=False, background_post_sync=True),
         {"target": params.target},
         params.target,
     )
@@ -4148,6 +4258,18 @@ from autoteam.config import (
 from autoteam.config import (
     AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS as _DEFAULT_BURN_GUARD_WINDOW_SECONDS,
 )
+from autoteam.config import (
+    AUTO_CHECK_AUTH_REPAIR_GUARD_COOLDOWN_SECONDS as _DEFAULT_AUTH_REPAIR_GUARD_COOLDOWN_SECONDS,
+)
+from autoteam.config import (
+    AUTO_CHECK_AUTH_REPAIR_GUARD_ENABLED as _DEFAULT_AUTH_REPAIR_GUARD_ENABLED,
+)
+from autoteam.config import (
+    AUTO_CHECK_AUTH_REPAIR_GUARD_MAX_INVALID as _DEFAULT_AUTH_REPAIR_GUARD_MAX_INVALID,
+)
+from autoteam.config import (
+    AUTO_CHECK_AUTH_REPAIR_GUARD_WINDOW_SECONDS as _DEFAULT_AUTH_REPAIR_GUARD_WINDOW_SECONDS,
+)
 
 # 运行时可修改的巡检配置
 _auto_check_config = {
@@ -4266,6 +4388,100 @@ def _auto_check_burn_guard_status(accounts: list[dict], *, now: float | None = N
         "remaining_seconds": max(0, int(blocked_until - now_ts)) if blocked else 0,
         "window_seconds": window,
         "max_exhausted": max_exhausted,
+        "cooldown_seconds": cooldown,
+    }
+
+
+def _collect_recent_auth_repair_invalidations(*, now: float, lookback_seconds: int) -> list[dict]:
+    cutoff = now - lookback_seconds
+    events: list[dict] = []
+    try:
+        from autoteam.account_state import DEFAULT_LOG_PATH
+
+        path = Path(DEFAULT_LOG_PATH)
+        if path.exists():
+            for line in read_text(path).splitlines():
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if row.get("from_state") != "active" or row.get("to_state") != "auth_invalid":
+                    continue
+                reason = str(row.get("reason") or "")
+                if not reason.startswith("auth_repair:"):
+                    continue
+                error_type = reason.split(":", 1)[1].strip()
+                if error_type not in {"exception", "login_failed"}:
+                    continue
+                email = str(row.get("email") or "")
+                if not email or _is_main_account_email(email):
+                    continue
+                try:
+                    ts = float(row.get("timestamp") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts >= cutoff:
+                    events.append(
+                        {
+                            "email": email,
+                            "timestamp": ts,
+                            "reason": reason,
+                            "source": "state_log",
+                        }
+                    )
+    except Exception as exc:
+        logger.warning("[巡检] 认证修复熔断读取 state_log 失败: %s", exc)
+    return sorted(events, key=lambda item: item["timestamp"])
+
+
+def _auto_check_auth_repair_guard_status(*, now: float | None = None) -> dict:
+    if not _DEFAULT_AUTH_REPAIR_GUARD_ENABLED:
+        return {"blocked": False, "enabled": False}
+
+    now_ts = time.time() if now is None else float(now)
+    window = int(_DEFAULT_AUTH_REPAIR_GUARD_WINDOW_SECONDS)
+    max_invalid = int(_DEFAULT_AUTH_REPAIR_GUARD_MAX_INVALID)
+    cooldown = int(_DEFAULT_AUTH_REPAIR_GUARD_COOLDOWN_SECONDS)
+    lookback = max(window, cooldown)
+    events = _collect_recent_auth_repair_invalidations(now=now_ts, lookback_seconds=lookback)
+    recent_window_emails = sorted(
+        {
+            str(item["email"])
+            for item in events
+            if float(item["timestamp"]) >= now_ts - window
+        }
+    )
+
+    trip_at = 0.0
+    trip_emails: list[str] = []
+    for idx, event in enumerate(events):
+        event_ts = float(event["timestamp"])
+        cluster_start = event_ts - window
+        cluster = [
+            item for item in events[: idx + 1]
+            if cluster_start <= float(item["timestamp"]) <= event_ts
+        ]
+        unique_emails = sorted({str(item["email"]) for item in cluster})
+        if len(unique_emails) >= max_invalid:
+            trip_at = event_ts
+            trip_emails = unique_emails
+
+    blocked_until = trip_at + cooldown if trip_at else 0.0
+    blocked = bool(blocked_until and blocked_until > now_ts)
+    return {
+        "blocked": blocked,
+        "enabled": True,
+        "count": len(trip_emails),
+        "emails": trip_emails,
+        "recent_window_count": len(recent_window_emails),
+        "recent_window_emails": recent_window_emails,
+        "tripped_at": trip_at or None,
+        "blocked_until": blocked_until if blocked else None,
+        "remaining_seconds": max(0, int(blocked_until - now_ts)) if blocked else 0,
+        "window_seconds": window,
+        "max_invalid": max_invalid,
         "cooldown_seconds": cooldown,
     }
 
@@ -4564,6 +4780,7 @@ def _auto_check_loop():
             actual_invite_count = _team_member_invite_count(actual_team_count)
             actual_team_occupancy = _team_member_occupancy(actual_team_count)
             burn_guard = _auto_check_burn_guard_status(accounts)
+            auth_repair_guard = _auto_check_auth_repair_guard_status()
             if burn_guard.get("blocked"):
                 logger.warning(
                     "[巡检] 烧号熔断已生效: 最近 %d 秒内 %d 个子号耗尽(%s)，"
@@ -4573,6 +4790,15 @@ def _auto_check_loop():
                     burn_guard.get("count"),
                     ", ".join(burn_guard.get("emails") or []),
                     burn_guard.get("remaining_seconds"),
+                )
+            if auth_repair_guard.get("blocked"):
+                logger.warning(
+                    "[巡检] 认证修复熔断已生效: 最近 %d 秒内 %d 个子号因 auth_repair 临时异常失效(%s)，"
+                    "暂停自动补位/替换 %d 秒；手动操作不受影响。请检查代理、Playwright/Xvfb、OpenAI 页面状态",
+                    auth_repair_guard.get("window_seconds"),
+                    auth_repair_guard.get("count"),
+                    ", ".join(auth_repair_guard.get("emails") or []),
+                    auth_repair_guard.get("remaining_seconds"),
                 )
 
             if actual_team_occupancy > target_seats:
@@ -4743,6 +4969,13 @@ def _auto_check_loop():
                     should_start_auto_fill = True
 
                 if should_start_auto_fill:
+                    if auth_repair_guard.get("blocked"):
+                        logger.warning(
+                            "[巡检] active=%d < %d 但认证修复熔断中，本轮跳过 auto-fill",
+                            len(active),
+                            sub_account_target,
+                        )
+                        continue
                     if burn_guard.get("blocked"):
                         logger.warning(
                             "[巡检] active=%d < %d 但烧号熔断中，本轮跳过 auto-fill",
@@ -4853,6 +5086,11 @@ def _auto_check_loop():
                 logger.info("[巡检] 准备即时替换 (%d 个)...", len(emails_to_replace))
                 recent_burn_emails = set(burn_guard.get("recent_window_emails") or [])
                 next_burn_emails = recent_burn_emails | set(emails_to_replace)
+                if auth_repair_guard.get("blocked"):
+                    logger.warning(
+                        "[巡检] 认证修复熔断阻止 auto-replace: 本轮只标记耗尽，不自动补新号"
+                    )
+                    continue
                 if burn_guard.get("blocked") or len(next_burn_emails) >= int(_DEFAULT_BURN_GUARD_MAX_EXHAUSTED):
                     logger.warning(
                         "[巡检] 烧号熔断阻止 auto-replace: 最近窗口内将达到 %d/%d 个耗尽子号(%s)，"
@@ -4885,6 +5123,9 @@ def _auto_check_loop():
                     logger.info("[巡检] CPA/CLIProxy provider-auth 低水位，但有任务在跑，本轮跳过预防性轮转")
                     continue
                 _playwright_lock.release()
+                if auth_repair_guard.get("blocked"):
+                    logger.warning("[巡检] CPA/CLIProxy provider-auth 低水位，但认证修复熔断中，本轮跳过 auto-rotate")
+                    continue
                 if burn_guard.get("blocked"):
                     logger.warning("[巡检] CPA/CLIProxy provider-auth 低水位，但烧号熔断中，本轮跳过 auto-rotate")
                     continue

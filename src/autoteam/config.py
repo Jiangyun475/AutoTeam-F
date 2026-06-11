@@ -95,6 +95,22 @@ AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS = max(60, _get_int_env("AUTO_CHECK_BURN_GUA
 AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED = max(1, _get_int_env("AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED", 4))
 AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS = max(60, _get_int_env("AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS", 300))
 
+# 自动巡检认证修复熔断:短时间内多个子号因 auth_repair 临时异常进入 auth_invalid 时,
+# 暂停自动补位/替换,避免浏览器/代理/站点故障把整池误伤。
+AUTO_CHECK_AUTH_REPAIR_GUARD_ENABLED = _get_bool_env("AUTO_CHECK_AUTH_REPAIR_GUARD_ENABLED", True)
+AUTO_CHECK_AUTH_REPAIR_GUARD_WINDOW_SECONDS = max(
+    60,
+    _get_int_env("AUTO_CHECK_AUTH_REPAIR_GUARD_WINDOW_SECONDS", 3600),
+)
+AUTO_CHECK_AUTH_REPAIR_GUARD_MAX_INVALID = max(
+    1,
+    _get_int_env("AUTO_CHECK_AUTH_REPAIR_GUARD_MAX_INVALID", 4),
+)
+AUTO_CHECK_AUTH_REPAIR_GUARD_COOLDOWN_SECONDS = max(
+    60,
+    _get_int_env("AUTO_CHECK_AUTH_REPAIR_GUARD_COOLDOWN_SECONDS", 300),
+)
+
 
 # Sub2API target sync configuration. Empty required fields keep the target
 # disabled until explicitly configured.

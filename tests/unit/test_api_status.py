@@ -298,6 +298,10 @@ def test_auto_check_burn_guard_defaults_are_not_overly_strict():
     assert config.AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS == 3600
     assert config.AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED == 4
     assert config.AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS == 300
+    assert config.AUTO_CHECK_AUTH_REPAIR_GUARD_ENABLED is True
+    assert config.AUTO_CHECK_AUTH_REPAIR_GUARD_WINDOW_SECONDS == 3600
+    assert config.AUTO_CHECK_AUTH_REPAIR_GUARD_MAX_INVALID == 4
+    assert config.AUTO_CHECK_AUTH_REPAIR_GUARD_COOLDOWN_SECONDS == 300
 
 
 def test_auto_check_burn_guard_detects_cluster_from_state_log(tmp_path, monkeypatch):
@@ -341,6 +345,115 @@ def test_auto_check_burn_guard_detects_cluster_from_state_log(tmp_path, monkeypa
     assert status["remaining_seconds"] == 580
 
 
+def test_auto_check_auth_repair_guard_detects_exception_cluster(tmp_path, monkeypatch):
+    state_log = tmp_path / "state_log.jsonl"
+    state_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "email": f"child-{idx}@example.com",
+                        "from_state": "active",
+                        "to_state": "auth_invalid",
+                        "reason": "auth_repair:exception",
+                        "timestamp": 900 + idx * 10,
+                    }
+                )
+                for idx in range(4)
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(account_state, "DEFAULT_LOG_PATH", state_log)
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api, "_DEFAULT_AUTH_REPAIR_GUARD_ENABLED", True)
+    monkeypatch.setattr(api, "_DEFAULT_AUTH_REPAIR_GUARD_WINDOW_SECONDS", 3600)
+    monkeypatch.setattr(api, "_DEFAULT_AUTH_REPAIR_GUARD_MAX_INVALID", 4)
+    monkeypatch.setattr(api, "_DEFAULT_AUTH_REPAIR_GUARD_COOLDOWN_SECONDS", 300)
+
+    status = api._auto_check_auth_repair_guard_status(now=1_000)
+
+    assert status["blocked"] is True
+    assert status["count"] == 4
+    assert status["remaining_seconds"] == 230
+
+
+def test_auth_repair_recovery_candidates_only_match_screenshot_misclassification(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-yun@example.com-team.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(api, "_is_main_account_email", lambda email: email == "owner@example.com")
+
+    rows = api._auth_repair_recovery_candidates(
+        [
+            {
+                "email": "yun@example.com",
+                "status": "auth_invalid",
+                "auth_last_error": "exception",
+                "auth_last_error_detail": "Page.screenshot: Timeout 30000ms exceeded.",
+                "auth_file": str(auth_file),
+            },
+            {
+                "email": "hard@example.com",
+                "status": "auth_invalid",
+                "auth_last_error": "non_team_plan",
+                "auth_last_error_detail": "free",
+                "auth_file": str(auth_file),
+            },
+            {
+                "email": "owner@example.com",
+                "status": "auth_invalid",
+                "auth_last_error": "exception",
+                "auth_last_error_detail": "Page.screenshot: Timeout 30000ms exceeded.",
+                "auth_file": str(auth_file),
+            },
+        ]
+    )
+
+    assert [row["email"] for row in rows] == ["yun@example.com"]
+
+
+def test_auth_repair_recover_misclassified_apply_restores_standby(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-yun@example.com-team.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    updates = []
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {
+                "email": "yun@example.com",
+                "status": "auth_invalid",
+                "auth_last_error": "exception",
+                "auth_last_error_detail": "Page.screenshot: Timeout 30000ms exceeded.",
+                "auth_file": str(auth_file),
+            }
+        ],
+    )
+    monkeypatch.setattr("autoteam.accounts.update_account", lambda email, **fields: updates.append((email, fields)))
+
+    result = api.post_auth_repair_recover_misclassified(
+        api.AuthRepairRecoverParams(apply=True, emails=["yun@example.com"])
+    )
+
+    assert result["restored"] == ["yun@example.com"]
+    assert updates == [
+        (
+            "yun@example.com",
+            {
+                "status": "standby",
+                "auth_retry_count": 0,
+                "auth_last_error": None,
+                "auth_last_error_detail": None,
+                "auth_last_failed_at": None,
+                "auth_retry_after": None,
+                "auth_retry_paused": False,
+                "_reason": "recover_auth_repair_misclassification",
+            },
+        )
+    ]
+
+
 def test_auto_check_burn_guard_blocks_auto_fill(tmp_path, monkeypatch, caplog):
     auth_file = tmp_path / "active.json"
     auth_file.write_text(json.dumps({"access_token": "token"}), encoding="utf-8")
@@ -364,6 +477,7 @@ def test_auto_check_burn_guard_blocks_auto_fill(tmp_path, monkeypatch, caplog):
             "remaining_seconds": 300,
         },
     )
+    monkeypatch.setattr(api, "_auto_check_auth_repair_guard_status", lambda: {"blocked": False})
     monkeypatch.setattr(
         "autoteam.accounts.load_accounts",
         lambda: [{"email": "active@example.com", "status": "active", "auth_file": str(auth_file)}],
@@ -413,6 +527,7 @@ def test_auto_check_burn_guard_blocks_auto_replace_after_marking_exhausted(tmp_p
             "remaining_seconds": 300,
         },
     )
+    monkeypatch.setattr(api, "_auto_check_auth_repair_guard_status", lambda: {"blocked": False})
     monkeypatch.setattr(
         "autoteam.accounts.load_accounts",
         lambda: [{"email": "active@example.com", "status": "active", "auth_file": str(auth_file)}],
@@ -1110,7 +1225,7 @@ def test_post_rotate_runs_final_sync_in_background(monkeypatch):
     assert kwargs == {}
 
     func(3)
-    assert rotate_calls == [((3,), {"force_auth_repair": True, "background_post_sync": True})]
+    assert rotate_calls == [((3,), {"force_auth_repair": False, "background_post_sync": True})]
 
 
 def test_post_fill_defers_sync_and_status_to_background(monkeypatch):

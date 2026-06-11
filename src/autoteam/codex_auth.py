@@ -291,8 +291,11 @@ def _classify_oauth_failure(url: str | None, body_excerpt: str = ""):
 
 
 def _screenshot(page, name):
-    SCREENSHOT_DIR.mkdir(exist_ok=True)
-    page.screenshot(path=str(SCREENSHOT_DIR / name), full_page=True)
+    try:
+        SCREENSHOT_DIR.mkdir(exist_ok=True)
+        page.screenshot(path=str(SCREENSHOT_DIR / name), timeout=5000)
+    except Exception as exc:
+        logger.warning("[截图] %s 失败，忽略: %s", name, exc)
 
 
 def _build_auth_url(code_challenge, state):

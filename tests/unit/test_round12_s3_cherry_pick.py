@@ -261,18 +261,22 @@ class TestChatgptSessionReady:
 # 6. invite_to_team helper
 # ===========================================================================
 class TestInviteToTeam:
-    def test_returns_true_on_200_no_errored(self):
+    def test_returns_true_on_200_no_errored(self, monkeypatch):
         api = MagicMock()
+        api.is_started = MagicMock(return_value=True)
         api.invite_member.return_value = (200, {"errored_emails": []})
+        monkeypatch.setattr(manager_mod, "_prepare_remote_capacity_for_new_seat", lambda *args, **kwargs: True)
         assert manager_mod.invite_to_team(api, "x@example.com") is True
         api.invite_member.assert_called_once_with("x@example.com", seat_type="default")
 
-    def test_falls_back_to_usage_based_when_default_errored(self):
+    def test_falls_back_to_usage_based_when_default_errored(self, monkeypatch):
         api = MagicMock()
+        api.is_started = MagicMock(return_value=True)
         api.invite_member.side_effect = [
             (200, {"errored_emails": [{"error": "default_blocked"}]}),
             (200, {"errored_emails": []}),
         ]
+        monkeypatch.setattr(manager_mod, "_prepare_remote_capacity_for_new_seat", lambda *args, **kwargs: True)
         assert manager_mod.invite_to_team(api, "x@example.com") is True
         assert api.invite_member.call_count == 2
         assert api.invite_member.call_args_list[1][1] == {"seat_type": "usage_based"}
@@ -583,29 +587,36 @@ class TestRecordAuthRepairFailure:
         )
         return "victim@example.com"
 
-    def test_normal_failure_decay_retry(
+    def test_transient_exception_decay_retry_preserves_status(
         self, seeded_account, monkeypatch
     ):
-        """普通错误 → 衰退式 retry_after, paused=False, status=AUTH_INVALID(留 team)。"""
-        # Account is in team → final_status should be AUTH_INVALID
+        """临时异常 → 衰退式 retry_after, paused=False, 不释放席位也不写 AUTH_INVALID。"""
         monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", False)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
+        monkeypatch.setattr(
+            manager_mod,
+            "_release_auth_repair_team_seat",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("transient failure must not release seat")),
+        )
 
         result = manager_mod._record_auth_repair_failure(
-            seeded_account, error_type="email_verification"
+            seeded_account,
+            error_type="exception",
+            error_detail="Page.screenshot: Timeout 30000ms exceeded.",
         )
 
         assert result["auth_retry_paused"] is False
         assert result["auth_retry_after"] is not None
         assert result["auth_retry_count"] == 1
-        assert result["status"] == accounts_mod.STATUS_AUTH_INVALID
+        assert result["status"] == accounts_mod.STATUS_ACTIVE
         assert result["seat_released"] is False
         assert result["release_attempted"] is False
+        assert result["transient"] is True
 
         # Verify accounts.json reflects the state
         acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
-        assert acc["status"] == accounts_mod.STATUS_AUTH_INVALID
-        assert acc["auth_last_error"] == "email_verification"
+        assert acc["status"] == accounts_mod.STATUS_ACTIVE
+        assert acc["auth_last_error"] == "exception"
 
     def test_hard_failure_pauses_and_releases_seat(
         self, seeded_account, monkeypatch
@@ -656,6 +667,7 @@ class TestRecordAuthRepairFailure:
         self, seeded_account, monkeypatch
     ):
         """add_phone 超过 max_retries → paused=True + 释放席位."""
+        monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         # Pre-seed 3 prior add_phone failures
         accounts_mod.update_account(
@@ -688,6 +700,7 @@ class TestRecordAuthRepairFailure:
         self, seeded_account, monkeypatch
     ):
         """email_verification exhausts retry budget → release seat and disable reuse."""
+        monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
         accounts_mod.update_account(
@@ -720,6 +733,7 @@ class TestRecordAuthRepairFailure:
         self, seeded_account, monkeypatch
     ):
         """login_state_lost without local auth is a Team blocker when skip-reuse is enabled."""
+        monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
         monkeypatch.setattr(manager_mod, "_release_auth_repair_team_seat", lambda email, **kw: "removed")

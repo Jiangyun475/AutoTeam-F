@@ -287,12 +287,9 @@ AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES = frozenset(
         "auth_error_discard",
         "unsupported_region",
         "oauth_timeout",
-        "site_unavailable",
         "token_exchange_failed",
         "non_team_plan",
         "auth_code_missing",
-        "login_failed",
-        "exception",
     }
 )
 
@@ -956,6 +953,32 @@ def _should_aggressively_release_auth_failure(error_type: str | None, *, discard
     return normalized in AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES
 
 
+AUTH_REPAIR_TRANSIENT_FAILURE_TYPES = frozenset({"exception", "login_failed", "site_unavailable"})
+AUTH_REPAIR_TRANSIENT_DETAIL_MARKERS = (
+    "page.screenshot",
+    "timeout",
+    "timed out",
+    "net::",
+    "network",
+    "connection",
+    "proxy",
+    "temporarily unavailable",
+    "try again later",
+    "context deadline exceeded",
+)
+
+
+def _is_transient_auth_repair_failure(error_type: str | None, error_detail: str | None = None) -> bool:
+    """Return whether an auth repair failure is environmental/retryable, not proof of bad credentials."""
+    normalized = str(error_type or "").strip()
+    detail = str(error_detail or "").lower()
+    if normalized in AUTH_REPAIR_TRANSIENT_FAILURE_TYPES:
+        return True
+    if normalized:
+        return False
+    return any(marker in detail for marker in AUTH_REPAIR_TRANSIENT_DETAIL_MARKERS)
+
+
 def _record_auth_repair_failure(
     email: str,
     error_type: str | None = None,
@@ -1074,6 +1097,25 @@ def _record_auth_repair_failure(
         release_team_seat = False
 
     update_account(email, **state)
+
+    if _is_transient_auth_repair_failure(error_type, error_detail):
+        refreshed_acc = find_account(load_accounts(), email) or {}
+        current_status = acc.get("status") or refreshed_acc.get("status")
+        logger.warning(
+            "[认证修复] %s 遇到临时错误(%s)，仅记录 retry_after，不释放席位，不改 auth_invalid",
+            email,
+            error_type,
+        )
+        return {
+            **state,
+            "status": current_status,
+            "seat_released": False,
+            "release_attempted": False,
+            "remove_status": None,
+            "protected_local_credential": protected_local_credential,
+            "protected_replacement_override": protected_replacement_override,
+            "transient": True,
+        }
 
     is_team_member = _is_email_in_team(email)
     if not is_team_member and acc.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_INVALID):

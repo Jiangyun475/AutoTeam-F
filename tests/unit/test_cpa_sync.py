@@ -6,6 +6,30 @@ from autoteam import cpa_sync
 from autoteam import mail as mail_module
 
 
+def test_active_auth_publish_decision_keeps_remote_during_transient_repair_cooldown(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-child@example.com-team-a.json"
+    auth_file.write_text('{"access_token":"token"}', encoding="utf-8")
+
+    monkeypatch.setattr(cpa_sync.time, "time", lambda: 1_000)
+    monkeypatch.setattr(
+        "autoteam.codex_auth.check_codex_quota",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cooldown must skip quota validation")),
+    )
+
+    decision = cpa_sync._active_auth_publish_decision(
+        {
+            "email": "child@example.com",
+            "status": "active",
+            "auth_last_error": "exception",
+            "auth_last_error_detail": "Page.screenshot: Timeout 30000ms exceeded.",
+            "auth_retry_after": 1_300,
+        },
+        auth_file,
+    )
+
+    assert decision == "keep_remote"
+
+
 def test_list_cpa_files_raises_on_non_200(monkeypatch):
     class _Resp:
         status_code = 503
@@ -14,7 +38,7 @@ def test_list_cpa_files_raises_on_non_200(monkeypatch):
         def json(self):
             raise AssertionError("json() should not be called for non-200 responses")
 
-    monkeypatch.setattr(cpa_sync.requests, "get", lambda *_args, **_kwargs: _Resp())
+    monkeypatch.setattr(cpa_sync._CPA_SESSION, "request", lambda *_args, **_kwargs: _Resp())
 
     with pytest.raises(RuntimeError, match="auth-files list failed"):
         cpa_sync.list_cpa_files()
@@ -28,7 +52,7 @@ def test_list_cpa_files_raises_on_non_json(monkeypatch):
         def json(self):
             raise ValueError("not json")
 
-    monkeypatch.setattr(cpa_sync.requests, "get", lambda *_args, **_kwargs: _Resp())
+    monkeypatch.setattr(cpa_sync._CPA_SESSION, "request", lambda *_args, **_kwargs: _Resp())
 
     with pytest.raises(RuntimeError, match="returned non-JSON"):
         cpa_sync.list_cpa_files()

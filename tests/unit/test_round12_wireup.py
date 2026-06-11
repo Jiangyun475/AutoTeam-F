@@ -86,6 +86,9 @@ class TestC1AuthRepairWireUp:
         monkeypatch.setattr(manager_mod, "login_codex_via_browser", lambda *a, **kw: None)
         monkeypatch.setattr(manager_mod, "remove_from_team", lambda *a, **kw: "already_absent")
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: False)
+        monkeypatch.setattr(manager_mod, "invite_to_team", lambda *a, **kw: True)
+        monkeypatch.setattr(manager_mod, "_wait_for_invite_link", lambda *a, **kw: "https://invite.example")
+        monkeypatch.setattr(manager_mod, "_accept_existing_account_team_invite", lambda *a, **kw: "")
         # _release_auth_repair_team_seat path goes to no-op since we mock ChatGPTTeamAPI
 
         chatgpt_stub = types.SimpleNamespace(
@@ -124,6 +127,9 @@ class TestC1AuthRepairWireUp:
         )
         monkeypatch.setattr(manager_mod, "remove_from_team", lambda *a, **kw: "removed")
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: False)
+        monkeypatch.setattr(manager_mod, "invite_to_team", lambda *a, **kw: True)
+        monkeypatch.setattr(manager_mod, "_wait_for_invite_link", lambda *a, **kw: "https://invite.example")
+        monkeypatch.setattr(manager_mod, "_accept_existing_account_team_invite", lambda *a, **kw: "")
 
         chatgpt_stub = types.SimpleNamespace(
             browser=None, start=lambda: None, stop=lambda: None,
@@ -208,6 +214,9 @@ class TestC1AuthRepairWireUp:
         )
         monkeypatch.setattr(manager_mod, "save_auth_file", lambda b: "/tmp/ok.json")
         monkeypatch.setattr(manager_mod, "get_chatgpt_account_id", lambda: "ws-x")
+        monkeypatch.setattr(manager_mod, "invite_to_team", lambda *a, **kw: True)
+        monkeypatch.setattr(manager_mod, "_wait_for_invite_link", lambda *a, **kw: "https://invite.example")
+        monkeypatch.setattr(manager_mod, "_accept_existing_account_team_invite", lambda *a, **kw: "")
 
         chatgpt_stub = types.SimpleNamespace(
             browser=None, start=lambda: None, stop=lambda: None,

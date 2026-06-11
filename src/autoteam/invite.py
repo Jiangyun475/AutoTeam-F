@@ -164,10 +164,13 @@ def assert_not_blocked(page, step):
 
 
 def screenshot(page, name):
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-    path = f"{SCREENSHOT_DIR}/{name}"
-    page.screenshot(path=path, full_page=True)
-    logger.debug("[截图] %s", path)
+    try:
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        path = f"{SCREENSHOT_DIR}/{name}"
+        page.screenshot(path=path, timeout=5000)
+        logger.debug("[截图] %s", path)
+    except Exception as exc:
+        logger.warning("[截图] %s 失败，忽略: %s", name, exc)
 
 
 def _page_excerpt(page, limit=240):
