@@ -268,3 +268,199 @@ CLIProxyAPI proxy-url=http://127.0.0.1:7901
 - 自动巡检连续多轮显示 `available=2/2`,额度正常。
 
 本次过程中 `yun9` 被检测为 5h 额度耗尽,转回 `standby`;`yun5` 成功接受邀请、完成 Codex OAuth、保存 team auth,并同步到 CPA。
+
+## 2026-06-11 追加修复: standby 冷却误判与烧号熔断
+
+### 新现象
+
+现场出现两个相互关联的问题:
+
+- 前端显示 standby 账号 `5h剩余 99% · 周剩余 63%`,但仍提示很久之后才参与复用。
+- 用户短时间开启多个 Codex 任务,模型为高推理档位,并使用 priority/fast 服务层后,多个子号在几十分钟内连续进入 5h 额度耗尽状态。
+
+这两个问题的影响不同:
+
+- 冷却误判会让已经恢复的 standby 账号排在后面,造成“明明有号却不补”的错觉。
+- 连续高强度任务会让自动巡检不断补入下一个 standby,形成“串行烧池”:一个 active 耗尽后立即换下一个,最后整个池子的 5h 窗口都被消耗。
+
+### 根因
+
+#### 1. 旧 `quota_resets_at` 比新 `last_quota` 优先级过高
+
+账号被标记耗尽时会写入:
+
+- `quota_exhausted_at`
+- `quota_resets_at`
+
+后续 standby 探测又会写入更具体的 `last_quota`:
+
+- `primary_pct`
+- `primary_resets_at`
+- `weekly_pct`
+- `weekly_resets_at`
+
+旧逻辑在排序和前端展示时仍优先相信 `quota_resets_at`。如果 `quota_resets_at` 是未来时间,即使 `last_quota` 已经显示 5h 额度恢复,账号仍会被显示为“等待复用”。
+
+正确原则:
+
+```text
+last_quota 是更具体、更接近实时的额度事实。
+如果 last_quota 显示 5h 或周额度仍可用,旧 quota_resets_at 不能继续阻塞复用。
+如果 last_quota 显示 5h/周额度真正耗尽,才继续等待对应 reset 时间。
+```
+
+#### 2. high reasoning + priority/fast 会快速消耗 5h 额度
+
+现场日志显示请求具备以下特征:
+
+- `model: gpt-5.5`
+- `reasoning.effort: xhigh`
+- `service_tier: priority`
+- 单次请求体很大,包含大量上下文。
+- 同时存在多个 Codex 任务和失败后的重试。
+
+`fast/priority` 不是“省额度模式”,只是更快服务层。高推理档位和大上下文会显著放大单次请求消耗。多个任务并发时,CPA 的 `fill-first` 策略会倾向先用完一个 auth,再切到下一个 auth,因此很容易出现:
+
+```text
+yunA active -> 5h 耗尽
+自动巡检补 yunB
+yunB active -> 5h 耗尽
+自动巡检补 yunC
+...
+```
+
+这不是 Team 周额度一定全部用光,而是多个账号的 5h 窗口被连续打满。
+
+### 追加代码修改
+
+#### standby 恢复判断
+
+`src/autoteam/accounts.py`:
+
+- 新增 `_quota_snapshot_recovered()`。
+- `get_standby_accounts()` 先根据 `last_quota` 判断是否恢复。
+- 只有缺少有效 `last_quota` 时,才回退使用旧 `quota_resets_at`。
+- standby 排序继续优先周剩余额度和 5h 剩余额度,但低于巡检阈值的账号会靠后。
+
+`src/autoteam/api.py`:
+
+- 前端状态计算新增 `primary_exhausted`、`weekly_exhausted`、`primary_low`。
+- 只有真正走旧字段回退时才显示 `复用冷却 ...`。
+- 当 `last_quota` 显示额度已恢复时,不再展示“很久之后才参与复用”。
+
+`web/src/components/Dashboard.vue`:
+
+- 增加 `5h额度偏低`、`5h额度耗尽` 展示文案。
+- 缩短冷却文案,避免表格列被长文本截断。
+
+#### 自动巡检烧号熔断
+
+`src/autoteam/config.py` 新增配置:
+
+```text
+AUTO_CHECK_BURN_GUARD_ENABLED=true
+AUTO_CHECK_BURN_GUARD_WINDOW_SECONDS=3600
+AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED=2
+AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS=14400
+```
+
+默认含义:
+
+- 1 小时内如果有 2 个不同子号从 `active` 进入 `exhausted`,认为当前任务强度异常。
+- 触发后 4 小时内暂停后台自动补位、自动替换、预防性 auto-rotate。
+- 手动 `rotate/fill/cleanup` 不受限制。
+- Team 超员 / stale invite 清理不受限制,因为清理不会消耗新号额度。
+
+`src/autoteam/api.py` 新增:
+
+- `_collect_recent_quota_exhaustions()`
+- `_auto_check_burn_guard_status()`
+
+熔断判断优先读取 `state_log.jsonl` 中真实的:
+
+```text
+from_state=active
+to_state=exhausted
+```
+
+如果 state log 不可读,再降级使用 `accounts.json` 的 `quota_exhausted_at`。
+
+熔断影响范围:
+
+- 阻止 `auto-fill`。
+- 阻止 `auto-replace` 继续拉入新 standby。
+- 阻止 provider-auth 低水位触发的预防性 `auto-rotate`。
+- 不改 CPA 配置。
+- 不重启 CPA。
+- 不影响人工点击轮转。
+
+### 当前运行态验证
+
+重启范围:
+
+- 只重启 `autoteam8787`。
+- 未重启 `cpa8317`。
+
+验证结果:
+
+```text
+AutoTeam-F API: 正常启动
+CloudMail: 验证通过
+CPA: 验证通过,当前 2 个认证文件
+API /api/status?fast=true: 200
+本地账号池: active=2, standby=7, total=9
+当前 active 子号: yun10, yun3
+CPA provider auth: 2/2
+```
+
+验证命令:
+
+```bash
+AutoTeam-F/.venv/bin/python -m pytest \
+  AutoTeam-F/tests/unit/test_api_status.py \
+  AutoTeam-F/tests/unit/test_accounts.py \
+  AutoTeam-F/tests/unit/test_manager_rotate.py \
+  AutoTeam-F/tests/unit/test_round12_s6_concurrent.py \
+  -q
+```
+
+结果:
+
+```text
+77 passed
+```
+
+其他验证:
+
+```bash
+AutoTeam-F/.venv/bin/python -m py_compile \
+  AutoTeam-F/src/autoteam/api.py \
+  AutoTeam-F/src/autoteam/config.py
+
+npm run build
+git -C AutoTeam-F diff --check
+```
+
+### 维护建议
+
+如果需要长时间跑多个 Codex 高强度任务:
+
+- 不建议同时跑多个 `xhigh + priority/fast`。
+- 需要保池时,把任务降到普通推理档位或减少并发。
+- 如果熔断触发,先让 5h 窗口自然恢复,不要手动连续补位。
+- 如果确实要强行继续消耗池子,可以手动执行 rotate/fill;这属于人工决策,不会被熔断拦截。
+
+如果确认自己的工作负载可以接受更激进的自动补位,再调整:
+
+```text
+AUTO_CHECK_BURN_GUARD_MAX_EXHAUSTED=3
+AUTO_CHECK_BURN_GUARD_COOLDOWN_SECONDS=7200
+```
+
+不建议关闭:
+
+```text
+AUTO_CHECK_BURN_GUARD_ENABLED=false
+```
+
+除非已经明确知道当前任务不会触发连续 5h 额度耗尽。
