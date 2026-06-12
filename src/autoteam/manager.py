@@ -1935,6 +1935,24 @@ def sync_account_states(chatgpt_api=None):
                 )
                 acc["status"] = STATUS_STANDBY
                 changed = True
+        elif not in_team and acc["status"] == STATUS_AUTH_INVALID and not acc.get("auth_retry_paused"):
+            # 被踢 → OpenAI 双废 token → 标 auth_invalid 的"活号":账号本身可重新
+            # 邀请 → OAuth 救活,但此前会永久卡死(sync 只认 active/standby,
+            # reinvite 只选 standby),可用号池持续失血。放回 standby 重新进入复用
+            # 流程,让 reinvite_account 走"邀请进团 → OAuth 拿 team token"救活。
+            # auth_retry_paused=True 的硬失败(add-phone/人机验证/重试超限)保持
+            # auth_invalid 待人工,不在此自动回收;in_team 的 auth_invalid 也不动
+            # (token 死但还占席位,交给对账/补登录处理)。
+            _transition_status(
+                acc["email"], STATUS_STANDBY,
+                _reason="sync_account_states:auth_invalid_recover",
+            )
+            acc["status"] = STATUS_STANDBY
+            changed = True
+            logger.info(
+                "[同步] %s auth_invalid 但不在 Team 且无硬失败标记 → 回收为 STANDBY 重新进入复用",
+                acc["email"],
+            )
 
     # FR-E2 并发探测被踢识别(只对 need_probe 中的账号)
     if need_probe:

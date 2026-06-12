@@ -150,3 +150,32 @@ def test_sync_account_states_protects_existing_standby_auth_file(tmp_path, monke
     assert saved[0]["status"] == "active"
     assert saved[0]["workspace_account_id"] == "acc-1"
     assert saved[0]["protect_team_seat"] is True
+
+
+def test_sync_account_states_recovers_kicked_auth_invalid_to_standby(tmp_path, monkeypatch):
+    """被踢导致 token 死、标 auth_invalid 的活号(无硬失败标记)应回收为 standby,
+    重新进入 reinvite 复用;auth_retry_paused 的硬失败保持 auth_invalid 待人工。"""
+    auth_dir = tmp_path / "auths"
+    auth_dir.mkdir()
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acc-1")
+    monkeypatch.setattr("autoteam.codex_auth.AUTH_DIR", auth_dir)
+
+    accounts = [
+        {"email": "kicked@example.com", "status": "auth_invalid",
+         "auth_retry_paused": False, "workspace_account_id": "acc-1"},
+        {"email": "hardblocked@example.com", "status": "auth_invalid",
+         "auth_retry_paused": True, "workspace_account_id": "acc-1"},
+    ]
+    monkeypatch.setattr(manager, "load_accounts", lambda: [dict(a) for a in accounts])
+    monkeypatch.setattr(manager, "save_accounts", lambda a: None)
+
+    calls = []
+    monkeypatch.setattr(manager, "update_account", lambda email, **kw: calls.append((email, kw.get("status"))))
+
+    # Team 成员里没有这两个号 → not in_team
+    chatgpt = _FakeStartedChatGPT([])
+    manager.sync_account_states(chatgpt_api=chatgpt)
+
+    statuses = {email: status for email, status in calls}
+    assert statuses.get("kicked@example.com") == "standby"   # 无硬失败 → 回收复活
+    assert "hardblocked@example.com" not in statuses          # paused 硬失败 → 不动
