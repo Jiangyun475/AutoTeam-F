@@ -6159,6 +6159,9 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     #                              只能下次重新走完整 OAuth 拿新 token。锁 5h 反而让账号
     #                              无法被任何流程选中,死锁在 standby。
     fail_reason = "no_attempt"
+    # 假恢复锁定时间:实测拿到的"真正越限窗口"的重置时间(周耗尽 = 周重置)。
+    # 0 表示拿不到,下游退回 now+5h。
+    verify_lock_until = 0.0
     if access_token:
         try:
             try:
@@ -6179,8 +6182,20 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 p_remain = 100 - info.get("primary_pct", 0)
                 if p_remain >= threshold:
                     quota_verified = True
+                    w_pct = info.get("weekly_pct")
+                    if isinstance(w_pct, (int, float)) and 100 - w_pct < threshold:
+                        logger.warning(
+                            "[轮转] %s 复用成功但周剩余仅 %d%%,预计很快耗尽(届时按周重置锁定)",
+                            email,
+                            max(0, 100 - int(w_pct)),
+                        )
                 else:
                     fail_reason = "quota_low"
+                    # 5h 偏低:锁到 5h 窗口真实重置,而不是固定 now+5h(否则像
+                    # yun10 那样真实重置后还要白等一截)
+                    primary_resets_at = info.get("primary_resets_at")
+                    if isinstance(primary_resets_at, (int, float)):
+                        verify_lock_until = float(primary_resets_at)
                     logger.warning(
                         "[轮转] %s OAuth 成功但实测 5h 剩余 %d%% < %d%%,判定假恢复",
                         email,
@@ -6195,7 +6210,15 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                     update_account(email, last_quota=quota_info)
                     failed_quota_snapshot = quota_info
                 fail_reason = "exhausted"
-                logger.warning("[轮转] %s OAuth 成功但实测 exhausted,判定假恢复", email)
+                # 关键:用越限窗口的真实重置时间锁定。周耗尽时这里是周重置,
+                # 锁 5h 会让 rotate 整周每 5 小时重复 invite/kick 同一个号
+                verify_lock_until = float(quota_result_resets_at(info) or 0)
+                window = info.get("window") if isinstance(info, dict) else ""
+                logger.warning(
+                    "[轮转] %s OAuth 成功但实测 exhausted(window=%s),判定假恢复",
+                    email,
+                    window or "?",
+                )
             elif status_str == "no_quota":
                 # 没有发放任何配额(primary_total=0 或 rate_limit 字段全空),不是耗尽。
                 # 锁 5h 没意义,直接 AUTH_INVALID 让下游清账,避免反复假恢复。
@@ -6219,14 +6242,16 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         _cleanup_team_leftover(f"fake_recovery_{fail_reason}")
         now_ts = time.time()
         if fail_reason in ("exhausted", "quota_low"):
-            # 真的 quota 不足 → 锁 5h 等自然恢复
+            # 真的 quota 不足 → 锁到越限窗口的真实重置时间(周耗尽锁到周重置,
+            # 5h 偏低锁到 5h 重置);实测拿不到重置时间才退回 now+5h
+            lock_until = verify_lock_until if verify_lock_until > now_ts else now_ts + 18000
             update_account(
                 email,
                 status=STATUS_STANDBY,
                 auth_file=auth_file,
                 quota_exhausted_at=now_ts,
-                quota_resets_at=now_ts + 18000,
-                quota_cooldown_until=now_ts + 18000,
+                quota_resets_at=lock_until,
+                quota_cooldown_until=lock_until,
                 standby_since=now_ts,
                 standby_reason=f"fake_recovery_{fail_reason}",
                 standby_quota_snapshot=failed_quota_snapshot,
@@ -6580,6 +6605,16 @@ def _reuse_one_standby(
                         if p_remain < threshold:
                             logger.info("[4/5] 跳过 %s（剩余 %d%% < %d%%）", email, p_remain, threshold)
                             return {"email": email, "result": "skipped_quota", "error": None}
+                        w_pct = info.get("weekly_pct")
+                        if isinstance(w_pct, (int, float)) and 100 - w_pct < threshold:
+                            # 周剩余偏低不挡复用(仍是真实容量,候选排序已让它垫底),
+                            # 但要留痕:进 Team 后周额度烧完会按周重置时间锁定
+                            logger.warning(
+                                "[4/5] %s 周剩余仅 %d%%(低于阈值 %d%%),无更优候选,仍复用",
+                                email,
+                                max(0, 100 - int(w_pct)),
+                                threshold,
+                            )
                         quota_ok = True
                     if status_str == "network_error":
                         logger.info("[4/5] 跳过 %s（临时网络错误,本轮无法验证额度）", email)

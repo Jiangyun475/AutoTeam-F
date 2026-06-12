@@ -360,16 +360,41 @@ def _auto_check_threshold() -> int:
         return 10
 
 
+def _effective_weekly_remaining(acc: dict) -> float:
+    """估算 standby 账号当前周额度剩余百分比(0-100),仅用于候选排序。
+
+    取离队快照(无快照退回 last_quota)的 weekly_pct。周用量在重置前只增不减,
+    所以快照值是当前剩余的上界;若快照里的周重置时间已过,说明周窗口已滚动,
+    离队期间没有用量,按 100 处理。无任何数据时按 100(未知视为充足,保持
+    原 FIFO 行为)。注意:5h 快照会"假新鲜"(踢出后自然恢复),周快照没有这个
+    问题,这也是旧版去掉额度排序时担心的点——对周窗不成立。
+    """
+    snap = acc.get("standby_quota_snapshot")
+    if not (isinstance(snap, dict) and isinstance(acc.get("quota_snapshot_recorded_at"), (int, float))):
+        snap = acc.get("last_quota") if isinstance(acc.get("last_quota"), dict) else None
+    if not snap:
+        return 100.0
+    weekly_pct = snap.get("weekly_pct")
+    if not isinstance(weekly_pct, (int, float)):
+        return 100.0
+    weekly_reset = snap.get("weekly_resets_at")
+    if isinstance(weekly_reset, (int, float)) and 0 < weekly_reset <= time.time():
+        return 100.0
+    return max(0.0, min(100.0, 100.0 - float(weekly_pct)))
+
+
 def _standby_sort_key(acc: dict) -> tuple:
     recovered = bool(acc.get("_quota_recovered", False))
     cooldown_until = _standby_cooldown_until(acc)
     standby_since = _standby_since(acc)
 
-    # 先保证已出冷却的号排前；同一组内按进入 standby 队列的时间 FIFO。
-    # 不再按 last_quota 的周/5h 剩余排序,避免旧快照把刚踢出的账号排到前面。
+    # 先保证已出冷却的号排前;已恢复组内按"有效周剩余"降序(把周预算摊到
+    # 整个池子,周快没用完的号靠后),同档再按进入 standby 队列的时间 FIFO。
+    # 5h 剩余仍不参与排序(旧快照会把刚踢出的账号排到前面,见上方注释)。
     return (
         not recovered,
         0 if recovered else float(cooldown_until or 9999999999),
+        -_effective_weekly_remaining(acc) if recovered else 0.0,
         float(standby_since),
         str(acc.get("email") or ""),
     )

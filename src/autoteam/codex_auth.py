@@ -4009,13 +4009,16 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
     if weekly_exhausted and weekly_reset:
         reset_candidates.append(weekly_reset)
 
-    if not reset_candidates:
-        if primary_reset:
-            reset_candidates.append(primary_reset)
-        if weekly_reset:
-            reset_candidates.append(weekly_reset)
-
-    resets_at = max(reset_candidates) if reset_candidates else int(time.time() + 18000)
+    if reset_candidates:
+        # 真正越限的窗口里取最晚的:5h+周同时耗尽必须等周重置
+        resets_at = max(reset_candidates)
+    else:
+        # limit_reached=True 但两个窗口都 <100%(取整误差/瞬时限流):越限窗口
+        # 未知,锁到**最近**的重置时间,到点由下一次实测重新判定。这里若取 max
+        # 会把 5h 级别的限流按周重置封最长 7 天——"周额度明明没用完,号却
+        # 躺到下周"的根因之一。
+        fallback_candidates = [r for r in (primary_reset, weekly_reset) if r]
+        resets_at = min(fallback_candidates) if fallback_candidates else int(time.time() + 18000)
 
     if primary_exhausted and weekly_exhausted:
         window = "combined"

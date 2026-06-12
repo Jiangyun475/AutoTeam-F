@@ -98,7 +98,12 @@ def test_get_standby_accounts_orders_recovered_first_and_skips_main_account(tmp_
     assert accounts.get_next_reusable_account()["email"] == "always@example.com"
 
 
-def test_get_standby_accounts_uses_fifo_within_recovered(tmp_path, monkeypatch):
+def test_get_standby_accounts_prefers_higher_weekly_within_recovered(tmp_path, monkeypatch):
+    """已恢复组内按有效周剩余降序摊开周预算;同档按 FIFO;5h 剩余不参与排序。
+
+    周用量在重置前只增不减,快照里的周剩余是当前值的上界;周重置时间已过的
+    快照按满额(100)处理。无快照视为满额,保持旧 FIFO 行为。
+    """
     accounts_file = tmp_path / "accounts.json"
     monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
     monkeypatch.setattr(accounts, "get_admin_email", lambda: "owner@example.com")
@@ -133,16 +138,31 @@ def test_get_standby_accounts_uses_fifo_within_recovered(tmp_path, monkeypatch):
                 "quota_resets_at": now - 60,
                 "quota_exhausted_at": now - 50,
             },
+            {
+                "email": "weekly-reset-passed@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "quota_resets_at": now - 60,
+                "quota_exhausted_at": now - 40,
+                "last_quota": {
+                    "primary_pct": 0,
+                    "weekly_pct": 90,
+                    "weekly_resets_at": now - 10,
+                },
+            },
         ]
     )
 
     standby = accounts.get_standby_accounts()
 
     assert [item["email"] for item in standby] == [
-        "low-weekly@example.com",
+        # 周剩余 100(无快照)与 100(周窗已重置)同档,按 quota_exhausted_at FIFO
+        "unknown-quota@example.com",
+        "weekly-reset-passed@example.com",
+        # 周剩余 80 两个,FIFO:先离队的在前;5h 剩余(30% vs 90%)不影响顺序
         "high-weekly-low-primary@example.com",
         "high-weekly-high-primary@example.com",
-        "unknown-quota@example.com",
+        # 周剩余 20 殿后,即使 5h 是满的
+        "low-weekly@example.com",
     ]
 
 
