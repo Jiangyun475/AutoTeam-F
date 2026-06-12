@@ -22,3 +22,17 @@ def _isolate_state_log(tmp_path, monkeypatch):
         raising=False,
     )
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_quota_cache():
+    """清空 get_status 的实时额度缓存,避免跨测试串味(模块级缓存会被多个
+    用例共享,前一个用例的探测结果会污染后一个不同 mock 的断言)。"""
+    try:
+        from autoteam import api
+    except Exception:
+        yield
+        return
+    api._reset_live_quota_cache()
+    yield
+    api._reset_live_quota_cache()

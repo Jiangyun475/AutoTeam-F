@@ -1652,3 +1652,50 @@ def test_recoverable_auth_invalid_accounts_filters(monkeypatch):
     ]
     result = api._recoverable_auth_invalid_accounts(pool)
     assert [a["email"] for a in result] == ["kicked@example.com"]
+
+
+def test_get_status_caches_live_quota_within_ttl(tmp_path, monkeypatch):
+    """TTL 内重复调用 get_status 复用缓存,不再重探 OpenAI(削减探测频次)。"""
+    auth_file = tmp_path / "codex-child.json"
+    auth_file.write_text(json.dumps({"access_token": "tok", "account_id": "acct"}), encoding="utf-8")
+
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _e: False)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "child@example.com", "status": accounts.STATUS_ACTIVE, "auth_file": str(auth_file)}],
+    )
+    calls = []
+    monkeypatch.setattr(
+        "autoteam.codex_auth.check_codex_quota",
+        lambda *a, **k: calls.append(1) or ("ok", {"primary_pct": 3, "weekly_pct": 0}),
+    )
+
+    api._reset_live_quota_cache()
+    r1 = api.get_status()
+    r2 = api.get_status()  # TTL 内,应命中缓存
+    assert len(calls) == 1
+    assert r1["quota_cache"] == r2["quota_cache"]
+    assert r2["live_quota_status"] == {"child@example.com": "ok"}
+
+    # 缓存清空后(或过期)再探一次
+    api._reset_live_quota_cache()
+    api.get_status()
+    assert len(calls) == 2
+
+
+def test_get_status_fast_does_not_probe_or_cache(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-child.json"
+    auth_file.write_text(json.dumps({"access_token": "tok"}), encoding="utf-8")
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _e: False)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "child@example.com", "status": accounts.STATUS_ACTIVE, "auth_file": str(auth_file)}],
+    )
+    calls = []
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", lambda *a, **k: calls.append(1) or ("ok", {}))
+
+    api._reset_live_quota_cache()
+    r = api.get_status(fast=True)
+    assert calls == []
+    assert r["quota_cache"] == {}
+    assert r["live_quota_status"] == {}

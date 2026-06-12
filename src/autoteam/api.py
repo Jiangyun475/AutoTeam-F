@@ -3347,6 +3347,84 @@ def post_account_login(params: LoginAccountParams):
     return task
 
 
+# ---------------------------------------------------------------------------
+# get_status 实时额度探测的短 TTL 缓存。
+# 前端默认每 30s 轮询 /api/status,旧实现每次都串行重探所有号 —— 把
+# wham/usage 当高频接口反复打,既拖慢响应(N 个号最坏 N×30s),又与本项目
+# "尽量少惊动 OpenAI"的目标相悖。加 TTL 内复用,显著削减探测频次,并自然
+# 去重多标签/窗口聚焦/SSE 失效引发的并发轮询。探测逻辑/顺序保持不变。
+# ---------------------------------------------------------------------------
+_LIVE_QUOTA_LOCK = threading.Lock()
+_LIVE_QUOTA_CACHE: dict = {"at": 0.0, "quota_cache": {}, "live_quota_status": {}}
+
+
+def _live_quota_cache_ttl() -> float:
+    try:
+        return float(_auto_check_int_env("STATUS_LIVE_QUOTA_CACHE_TTL", 45))
+    except Exception:
+        return 45.0
+
+
+def _reset_live_quota_cache() -> None:
+    """清空实时额度缓存(测试隔离 / 强制刷新)。"""
+    with _LIVE_QUOTA_LOCK:
+        _LIVE_QUOTA_CACHE["at"] = 0.0
+        _LIVE_QUOTA_CACHE["quota_cache"] = {}
+        _LIVE_QUOTA_CACHE["live_quota_status"] = {}
+
+
+def _collect_live_quota_uncached(accounts: list[dict]) -> tuple[dict, dict]:
+    """逐个对在团/个人活号实时探额度。逻辑与旧 get_status 内联循环完全一致。"""
+    from autoteam.accounts import STATUS_ACTIVE, STATUS_PERSONAL, is_account_disabled
+    from autoteam.codex_auth import check_codex_quota, quota_result_quota_info
+
+    quota_cache: dict = {}
+    live_quota_status: dict = {}
+    for acc in accounts:
+        if not _is_main_account_email(acc.get("email")) and is_account_disabled(acc):
+            continue
+        if acc["status"] not in (STATUS_ACTIVE, STATUS_PERSONAL) and not _is_main_account_email(acc.get("email")):
+            continue
+        auth_file = _resolve_status_auth_file(acc)
+        if not auth_file:
+            continue
+        try:
+            auth_data = json.loads(read_text(Path(auth_file)))
+            access_token = auth_data.get("access_token") or (auth_data.get("tokens") or {}).get("access_token")
+            account_id = (
+                auth_data.get("account_id")
+                or (auth_data.get("tokens") or {}).get("account_id")
+                or acc.get("workspace_account_id")
+            )
+            if access_token:
+                status, info = check_codex_quota(access_token, account_id=account_id)
+                live_quota_status[acc["email"]] = status
+                if status == "ok" and isinstance(info, dict):
+                    quota_cache[acc["email"]] = info
+                elif status == "exhausted":
+                    quota_info = quota_result_quota_info(info)
+                    if quota_info:
+                        quota_cache[acc["email"]] = quota_info
+        except Exception:
+            live_quota_status[acc["email"]] = "network_error"
+    return quota_cache, live_quota_status
+
+
+def _collect_live_quota(accounts: list[dict]) -> tuple[dict, dict]:
+    """带短 TTL 缓存的实时额度探测;TTL 内直接复用上次结果。"""
+    now = time.time()
+    ttl = _live_quota_cache_ttl()
+    with _LIVE_QUOTA_LOCK:
+        if ttl > 0 and _LIVE_QUOTA_CACHE["at"] > 0 and (now - _LIVE_QUOTA_CACHE["at"]) < ttl:
+            return dict(_LIVE_QUOTA_CACHE["quota_cache"]), dict(_LIVE_QUOTA_CACHE["live_quota_status"])
+    quota_cache, live_quota_status = _collect_live_quota_uncached(accounts)
+    with _LIVE_QUOTA_LOCK:
+        _LIVE_QUOTA_CACHE["at"] = time.time()
+        _LIVE_QUOTA_CACHE["quota_cache"] = dict(quota_cache)
+        _LIVE_QUOTA_CACHE["live_quota_status"] = dict(live_quota_status)
+    return quota_cache, live_quota_status
+
+
 @app.get("/api/status")
 def get_status(fast: bool = False):
     """获取所有账号状态 + active 账号实时额度"""
@@ -3358,45 +3436,13 @@ def get_status(fast: bool = False):
         STATUS_PENDING,
         STATUS_PERSONAL,
         STATUS_STANDBY,
-        is_account_disabled,
         load_accounts,
     )
-    from autoteam.codex_auth import check_codex_quota, quota_result_quota_info
-
     accounts = load_accounts()
-    quota_cache = {}
-    live_quota_status = {}
-
-    if not fast:
-        for acc in accounts:
-            if not _is_main_account_email(acc.get("email")) and is_account_disabled(acc):
-                continue
-            if acc["status"] not in (STATUS_ACTIVE, STATUS_PERSONAL) and not _is_main_account_email(acc.get("email")):
-                continue
-
-            auth_file = _resolve_status_auth_file(acc)
-            if not auth_file:
-                continue
-
-            try:
-                auth_data = json.loads(read_text(Path(auth_file)))
-                access_token = auth_data.get("access_token") or (auth_data.get("tokens") or {}).get("access_token")
-                account_id = (
-                    auth_data.get("account_id")
-                    or (auth_data.get("tokens") or {}).get("account_id")
-                    or acc.get("workspace_account_id")
-                )
-                if access_token:
-                    status, info = check_codex_quota(access_token, account_id=account_id)
-                    live_quota_status[acc["email"]] = status
-                    if status == "ok" and isinstance(info, dict):
-                        quota_cache[acc["email"]] = info
-                    elif status == "exhausted":
-                        quota_info = quota_result_quota_info(info)
-                        if quota_info:
-                            quota_cache[acc["email"]] = quota_info
-            except Exception:
-                live_quota_status[acc["email"]] = "network_error"
+    if fast:
+        quota_cache, live_quota_status = {}, {}
+    else:
+        quota_cache, live_quota_status = _collect_live_quota(accounts)
 
     sanitized_accounts = [
         _sanitize_account(
