@@ -4836,6 +4836,30 @@ def _cpa_provider_auth_below_pool_target(gate: dict | None, pool_target: int) ->
     return available < target
 
 
+def _recoverable_auth_invalid_accounts(accounts: list[dict]) -> list[dict]:
+    """巡检稳定期(额度正常、无轮转)也应回收的卡死号。
+
+    被踢 → OpenAI 双废 token → 标 auth_invalid 的活号,账号本身可重新邀请救活,
+    但 sync_account_states 只在轮转/手动时跑,稳定期永远不会被回收 → 这些号会
+    永久卡在 auth_invalid、可用号池持续失血。命中条件:状态 auth_invalid、
+    非硬失败(auth_retry_paused=False,add-phone/人机验证等保持待人工)、
+    非主号、未禁用。"""
+    from autoteam.accounts import STATUS_AUTH_INVALID, is_account_disabled
+
+    out = []
+    for a in accounts:
+        if a.get("status") != STATUS_AUTH_INVALID:
+            continue
+        if a.get("auth_retry_paused"):
+            continue
+        if _is_main_account_email(a.get("email")):
+            continue
+        if is_account_disabled(a):
+            continue
+        out.append(a)
+    return out
+
+
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
@@ -5303,7 +5327,31 @@ def _auto_check_loop():
                     actual_team_count if actual_team_count >= 0 else "unknown",
                 )
             else:
-                logger.info("[巡检] 额度正常，无需替换")
+                # 额度正常 = 不轮转,但池子里可能仍有被踢卡死的 auth_invalid 活号。
+                # sync_account_states 只在轮转里跑,稳定期不会自愈,所以这里按需
+                # 触发一次对账,把可回收的卡死号放回 standby(也会顺带 reconcile
+                # 假 active)。无可回收号时才是真正的"无需替换"。
+                recoverable = _recoverable_auth_invalid_accounts(accounts)
+                if not recoverable:
+                    logger.info("[巡检] 额度正常，无需替换")
+                elif not _playwright_lock.acquire(blocking=False):
+                    logger.info(
+                        "[巡检] 额度正常但有 %d 个可回收 auth_invalid 号，任务在跑，下轮再对账",
+                        len(recoverable),
+                    )
+                else:
+                    _playwright_lock.release()
+                    logger.info(
+                        "[巡检] 额度正常，但有 %d 个可回收 auth_invalid 号(%s)，触发对账回收",
+                        len(recoverable),
+                        ", ".join((a.get("email") or "") for a in recoverable[:5]),
+                    )
+                    from autoteam.manager import sync_account_states
+
+                    try:
+                        _start_task("auto-sync", sync_account_states, {"trigger": "auto-check-recover"})
+                    except Exception as e:
+                        logger.error("[巡检] 对账回收启动失败: %s", e)
 
         except Exception as e:
             logger.error("[巡检] 巡检异常: %s", e)

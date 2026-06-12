@@ -1637,3 +1637,18 @@ def test_post_setup_save_rejects_invalid_rotation_account_strategy(monkeypatch):
     assert result.status_code == 400
     body = json.loads(result.body.decode("utf-8"))
     assert body["message"] == "ROTATE_NEW_ACCOUNT_MODE 必须是 domain_auto_join_first、invite_first 或 direct_first"
+
+
+def test_recoverable_auth_invalid_accounts_filters(monkeypatch):
+    """稳定期可回收的卡死号:auth_invalid + 非 paused + 非主号 + 未禁用。"""
+    monkeypatch.setattr(api, "_is_main_account_email", lambda e: e == "main@example.com")
+    pool = [
+        {"email": "kicked@example.com", "status": accounts.STATUS_AUTH_INVALID, "auth_retry_paused": False},
+        {"email": "hard@example.com", "status": accounts.STATUS_AUTH_INVALID, "auth_retry_paused": True},
+        {"email": "active@example.com", "status": accounts.STATUS_ACTIVE},
+        {"email": "disabled@example.com", "status": accounts.STATUS_AUTH_INVALID,
+         "auth_retry_paused": False, "disabled": True},
+        {"email": "main@example.com", "status": accounts.STATUS_AUTH_INVALID, "auth_retry_paused": False},
+    ]
+    result = api._recoverable_auth_invalid_accounts(pool)
+    assert [a["email"] for a in result] == ["kicked@example.com"]
