@@ -3235,17 +3235,28 @@ def post_account_login(params: LoginAccountParams):
                 },
             )
         if bundle:
-            auth_file = save_auth_file(bundle)
-            update_account(email, auth_file=auth_file, last_active_at=time.time())
+            # 先判 plan_type 再决定是否写 auth_file。绝不能先无条件 save+link:
+            # 否则 Team 子号补登录漂移到 free 时,记录会被指向 free token → 后续拿
+            # free token 探团 workspace 必 401 →"认证异常"死循环(本次根因)。
             plan_type = (bundle.get("plan_type") or "").lower()
 
             if use_personal:
-                # personal 补登录：不改状态（保持 PERSONAL），只刷新 auth_file
-                update_account(email, status=STATUS_PERSONAL)
+                # personal 补登录：期望 plan_type=free,放行覆盖,只刷新 auth_file + 保持 PERSONAL
+                auth_file = save_auth_file(bundle, protect_team=False)
+                update_account(
+                    email, auth_file=auth_file, last_active_at=time.time(), status=STATUS_PERSONAL
+                )
             elif plan_type == "team":
                 from autoteam.admin_state import get_chatgpt_account_id
 
-                update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
+                auth_file = save_auth_file(bundle, protect_team=True)
+                update_account(
+                    email,
+                    auth_file=auth_file,
+                    last_active_at=time.time(),
+                    status=STATUS_ACTIVE,
+                    workspace_account_id=get_chatgpt_account_id() or None,
+                )
                 token = bundle.get("access_token")
                 if token:
                     st, info = check_codex_quota(token)
@@ -3264,6 +3275,23 @@ def post_account_login(params: LoginAccountParams):
                                 "api_oauth_quota_exhausted",
                             ),
                         )
+            else:
+                # Team 子号补登录漂移到非 team(通常 free):**不写 auth_file、不改状态**。
+                # 保留原有凭证/状态不被污染,留痕 + 明确报错交由前端/调用方处置。
+                record_failure(
+                    email,
+                    category="plan_drift",
+                    reason=f"补登录拿到 plan_type={plan_type or 'unknown'}，非 team，已丢弃不覆盖凭证",
+                    stage="api_login",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "non_team_plan",
+                        "plan_type": plan_type or "unknown",
+                        "reason": "登录拿到非 Team 计划(通常是漂移到个人 free 工作空间)，未写入凭证。请确认账号已在 Team 中或稍后重试。",
+                    },
+                )
             # 同步到 CPA
             from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
 

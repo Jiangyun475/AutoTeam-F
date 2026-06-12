@@ -3707,7 +3707,9 @@ def _run_post_register_oauth(
             return None
 
         _attach_account_proxy_to_bundle(email, bundle, auth_proxy_url)
-        auth_file = save_auth_file(bundle)
+        # personal 转化本就期望 plan_type=free,放行覆盖(protect_team 守护仅针对
+        # Team 子号意外漂移到 free 的情况)。
+        auth_file = save_auth_file(bundle, protect_team=False)
         update_fields = {
             "status": STATUS_PERSONAL,
             "seat_type": "codex",

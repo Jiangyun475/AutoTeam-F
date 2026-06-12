@@ -3828,8 +3828,20 @@ def login_main_codex():
     return login_codex_via_session()
 
 
-def save_auth_file(bundle):
-    """保存 CPA 兼容的认证文件。同一邮箱只保留一个文件，优先 team。"""
+def save_auth_file(bundle, *, protect_team=True):
+    """保存 CPA 兼容的认证文件。同一邮箱只保留一个文件，优先 team。
+
+    protect_team=True(默认)时兑现"优先 team"的承诺:若本地已存在该邮箱的
+    `-team-` 凭证,而传入 bundle 的 ``plan_type != "team"``(典型是 Team 子号
+    重登 OAuth 漂移回个人 free 工作空间),**拒绝用 free 覆盖 team**——保留原
+    team 文件并原样返回其路径,不写入、不删除。这是"老是认证异常 / wham 401"
+    的直接元凶:一旦团凭证被 free 覆盖,后续拿 free token 探团 workspace 必然
+    401,且会触发重登→又漂 free→又覆盖的死循环。
+
+    合法的"降级保存"(personal 转化 / fill-personal,本就期望 plan_type=free)
+    需由调用方显式传 ``protect_team=False`` 放行。全新账号无 team 文件时本参数
+    不生效(没有可保护对象),按原行为写入。
+    """
     ensure_auth_dir()
 
     email = bundle["email"]
@@ -3837,8 +3849,20 @@ def save_auth_file(bundle):
     account_id = bundle.get("account_id", "")
     hash_id = hashlib.md5(account_id.encode()).hexdigest()[:8]
 
+    existing = sorted(AUTH_DIR.glob(f"codex-{email}-*.json"))
+    existing_team = [p for p in existing if "-team-" in p.name]
+
+    # 守护:已有 team 凭证 + 传入非 team bundle → 保留 team,拒绝覆盖。
+    if protect_team and plan_type != "team" and existing_team:
+        logger.warning(
+            "[Codex] %s 收到 plan_type=%s 的 bundle，但本地已存在 team 凭证 %s，"
+            "拒绝用非 team 覆盖（保留 team，避免 wham 401 死循环）",
+            email, plan_type, existing_team[0].name,
+        )
+        return str(existing_team[0])
+
     # 清理同一邮箱的旧文件（避免 free/team 并存）
-    for old in AUTH_DIR.glob(f"codex-{email}-*.json"):
+    for old in existing:
         old.unlink()
         logger.info("[Codex] 清理旧文件: %s", old.name)
 
