@@ -2739,8 +2739,21 @@ def login_codex_via_browser(
                 logger.warning("[Codex] 导航回 auth_url 失败: %s,consent loop 仍尝试", exc)
 
         # 处理多个授权/同意页面（可能有多步）
-        for step in range(10):
+        # 早退/可取消:OpenAI 在前一封验证码已验证后,Codex OAuth 阶段有时会反复弹
+        # "需要邮箱验证码"但**不再补发**新码 —— 旧逻辑会 10 步 × ~2 分钟空转(每步等
+        # 码超时),全程占着 Playwright 锁冻住整个系统。这里:① 每轮查 cancel_signal,
+        # 让前端"取消任务"在 OAuth 阶段也能打断;② 连续 _MAX_EMAIL_CODE_FAILURES 次取不到
+        # 码就放弃本次 OAuth(交由上层走失败/重试),不再死等;③ 上限 10→6 兜底。
+        from autoteam import cancel_signal
+
+        _MAX_EMAIL_CODE_FAILURES = 2
+        email_code_failures = 0
+        for step in range(6):
             if auth_code:
+                break
+
+            if cancel_signal.is_cancelled():
+                logger.warning("[Codex] 收到取消信号，中止 OAuth consent 循环 (step %d)", step + 1)
                 break
 
             # SPEC-2 shared/add-phone-detection §4 (位点 C-P2):consent 循环每轮开头探针。
@@ -2981,8 +2994,20 @@ def login_codex_via_browser(
                         require_sender=True,
                     )
                     if submit_status == "accepted":
+                        email_code_failures = 0
                         logger.info("[Codex] 验证码页已退出，继续后续授权流程")
                         continue
+                    if submit_status == "no_code":
+                        # 仅"等不到新验证码邮件"才累计(pending/input_unavailable 是页面
+                        # 过渡中的良性状态,不计)。连续多次 = OpenAI 不再补发,放弃死等。
+                        email_code_failures += 1
+                        if email_code_failures >= _MAX_EMAIL_CODE_FAILURES:
+                            logger.warning(
+                                "[Codex] 连续 %d 次未取到邮箱验证码(OpenAI 多半不再补发),放弃本次 OAuth (step %d)",
+                                email_code_failures,
+                                step + 1,
+                            )
+                            break
             except Exception:
                 pass
 
