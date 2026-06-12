@@ -116,6 +116,34 @@ def test_probe_endpoint_swallows_smoke_exception(tmp_path, monkeypatch):
     assert body["smoke_result"] == "uncertain"
 
 
+def test_probe_endpoint_marks_auth_invalid_only_when_quota_and_smoke_confirm(tmp_path, monkeypatch):
+    _seed_account(tmp_path, "probe-auth@x.com")
+
+    def fake_check(token, account_id=None):
+        return "auth_error", None
+
+    def fake_smoke(token, account_id=None, *, model="gpt-5", max_output_tokens=64, timeout=15.0, force=False):
+        return "auth_invalid", "http_401"
+
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", fake_check)
+    monkeypatch.setattr("autoteam.codex_auth.cheap_codex_smoke", fake_smoke)
+
+    from autoteam.api import ProbeAccountParams, post_account_probe
+
+    body = post_account_probe("probe-auth@x.com", ProbeAccountParams(force_codex_smoke=True))
+
+    assert body["quota_status"] == "auth_error"
+    assert body["smoke_result"] == "auth_invalid"
+    assert body["status_before"] == "active"
+    assert body["status_after"] == "auth_invalid"
+
+    from autoteam.accounts import find_account, load_accounts
+
+    acc = find_account(load_accounts(), "probe-auth@x.com")
+    assert acc["status"] == "auth_invalid"
+    assert acc["auth_last_error"] == "probe_confirmed_auth_invalid"
+
+
 def test_models_endpoint_returns_list(tmp_path, monkeypatch):
     _seed_account(tmp_path, "models1@x.com")
 

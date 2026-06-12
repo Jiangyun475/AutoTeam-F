@@ -162,6 +162,13 @@ export function statusStyle(s) {
 export function computeUsability(acc) {
   if (!acc) return { kind: 'unknown', label: '—', hint: '', tone: 'neutral' }
   const s = acc.status
+  const liveQuotaStatus = acc.live_quota_status
+  if (liveQuotaStatus === 'auth_error') {
+    return { kind: 'unusable', label: '认证异常', hint: '实时 quota 探测返回 401/403', tone: 'rose' }
+  }
+  if (liveQuotaStatus === 'network_error') {
+    return { kind: 'unknown', label: '网络未知', hint: '实时 quota 探测失败，保留本地状态', tone: 'neutral' }
+  }
   if (s === 'disabled') {
     return { kind: 'standby', label: '禁用', hint: '已从自动化流程排除', tone: 'neutral' }
   }

@@ -31,7 +31,7 @@ def test_get_status_normalizes_main_account_status_from_saved_auth(tmp_path, mon
     monkeypatch.setattr("autoteam.codex_auth.get_saved_main_auth_file", lambda: str(auth_file))
     monkeypatch.setattr(
         "autoteam.codex_auth.check_codex_quota",
-        lambda access_token: (
+        lambda access_token, **_kwargs: (
             "ok",
             {
                 "primary_pct": 8,
@@ -169,6 +169,77 @@ def test_get_status_fast_skips_live_quota_probe(tmp_path, monkeypatch):
     assert result["quota_cache"] == {}
     assert result["status_mode"] == {"fast": True, "quota_budget_seconds": 0, "live_quota": False}
     assert health_calls == [{"timeout": 0.5, "cache_ttl": 30.0}]
+
+
+def test_get_status_exposes_live_quota_auth_error(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-child.json"
+    auth_file.write_text(
+        json.dumps({"access_token": "token-child", "account_id": "acct-child"}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {
+                "email": "child@example.com",
+                "status": accounts.STATUS_ACTIVE,
+                "auth_file": str(auth_file),
+                "workspace_account_id": "acct-fallback",
+                "last_quota": {"primary_pct": 1, "weekly_pct": 0},
+            }
+        ],
+    )
+    calls = []
+    monkeypatch.setattr(
+        "autoteam.codex_auth.check_codex_quota",
+        lambda token, **kwargs: calls.append((token, kwargs)) or ("auth_error", None),
+    )
+
+    result = api.get_status()
+
+    assert calls == [("token-child", {"account_id": "acct-child"})]
+    assert result["quota_cache"] == {}
+    assert result["live_quota_status"] == {"child@example.com": "auth_error"}
+    assert result["accounts"][0]["live_quota_status"] == "auth_error"
+    assert result["accounts"][0]["status"] == accounts.STATUS_ACTIVE
+    assert "last_quota" not in result["accounts"][0]
+    assert result["accounts"][0]["primary_remaining_pct"] is None
+    assert result["accounts"][0]["weekly_remaining_pct"] is None
+
+
+def test_get_status_displays_active_as_exhausted_from_live_quota(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-child.json"
+    auth_file.write_text(json.dumps({"access_token": "token-child"}), encoding="utf-8")
+
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "child@example.com", "status": accounts.STATUS_ACTIVE, "auth_file": str(auth_file)}],
+    )
+    monkeypatch.setattr(
+        "autoteam.codex_auth.check_codex_quota",
+        lambda *_args, **_kwargs: (
+            "exhausted",
+            {
+                "quota_info": {
+                    "primary_pct": 100,
+                    "primary_resets_at": 1_800,
+                    "weekly_pct": 17,
+                    "weekly_resets_at": 9_000,
+                }
+            },
+        ),
+    )
+
+    result = api.get_status()
+
+    assert result["accounts"][0]["raw_status"] == accounts.STATUS_ACTIVE
+    assert result["accounts"][0]["status"] == accounts.STATUS_EXHAUSTED
+    assert result["accounts"][0]["primary_remaining_pct"] == 0
+    assert result["summary"]["active"] == 0
+    assert result["summary"]["exhausted"] == 1
 
 
 def test_get_playwright_context_options_uses_fingerprint_constants(monkeypatch):
@@ -1047,6 +1118,29 @@ def test_sanitize_account_does_not_let_stale_quota_unlock_cooldown(monkeypatch):
     assert sanitized["pool_rank_detail"] == "冷却中 10m"
 
 
+def test_sanitize_account_hides_untrusted_standby_last_quota(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api.time, "time", lambda: 1_000)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "new-standby@example.com",
+            "status": accounts.STATUS_STANDBY,
+            "last_quota": {
+                "primary_pct": 5,
+                "primary_resets_at": 1_783_780_927,
+                "weekly_pct": 0,
+                "weekly_resets_at": 0,
+            },
+        }
+    )
+
+    assert "last_quota" not in sanitized
+    assert sanitized["quota_display_scope"] == "standby_snapshot"
+    assert sanitized["primary_remaining_pct"] is None
+    assert sanitized["weekly_remaining_pct"] is None
+
+
 def test_sanitize_account_marks_primary_low_without_using_stale_cooldown(monkeypatch):
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
     monkeypatch.setattr(api.time, "time", lambda: 1_000)
@@ -1428,7 +1522,7 @@ def test_get_status_counts_disabled_and_skips_disabled_quota_checks(tmp_path, mo
 
     seen_tokens = []
 
-    def fake_check_quota(access_token):
+    def fake_check_quota(access_token, **_kwargs):
         seen_tokens.append(access_token)
         return (
             "ok",

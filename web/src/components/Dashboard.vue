@@ -540,7 +540,10 @@ function quotaInfo(acc) {
   if (quotaScope(acc) === 'standby_snapshot') {
     return acc.quota_snapshot_recorded_at ? acc.standby_quota_snapshot : null
   }
-  return props.status?.quota_cache?.[acc.email] || acc.last_quota
+  const liveQuota = props.status?.quota_cache?.[acc.email]
+  if (liveQuota) return liveQuota
+  if (acc.live_quota_status === 'auth_error' || acc.live_quota_status === 'network_error') return null
+  return acc.last_quota
 }
 
 function formatPoolTime(ts) {

@@ -1250,6 +1250,9 @@ def _display_account_status(acc: dict, quota_snapshot: dict | None = None) -> st
     if not _is_main_account_email(acc.get("email")):
         if is_account_disabled(acc):
             return "disabled"
+        quota_status = _quota_snapshot_status(quota_snapshot)
+        if status in ("active", "personal") and quota_status == "exhausted":
+            return "exhausted"
         return status
 
     quota_status = _quota_snapshot_status(quota_snapshot) or _quota_snapshot_status(acc.get("last_quota"))
@@ -1321,7 +1324,11 @@ def _account_cooldown_until(acc: dict) -> float | None:
     return None
 
 
-def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dict:
+def _account_pool_schedule(
+    acc: dict,
+    quota_snapshot: dict | None = None,
+    live_quota_status: str | None = None,
+) -> dict:
     raw_status = str(acc.get("status") or "")
     now = time.time()
     standby_like = raw_status in ("standby", "exhausted")
@@ -1335,6 +1342,9 @@ def _account_pool_schedule(acc: dict, quota_snapshot: dict | None = None) -> dic
     elif isinstance(quota_snapshot, dict) and not standby_like:
         quota_info = quota_snapshot
         quota_scope = "live"
+    elif raw_status in ("active", "personal") and live_quota_status in {"auth_error", "network_error"}:
+        quota_info = None
+        quota_scope = live_quota_status
     else:
         quota_info = None if standby_like else acc.get("last_quota")
         quota_scope = "standby_snapshot" if standby_like else "live"
@@ -1486,17 +1496,37 @@ def _account_pool_sort_key(acc: dict) -> tuple:
     )
 
 
-def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
+def _sanitize_account(
+    acc: dict,
+    quota_snapshot: dict | None = None,
+    live_quota_status: str | None = None,
+) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     sanitized = {
         k: v
         for k, v in acc.items()
         if k not in ("password", "cloudmail_account_id") and not str(k).startswith("_")
     }
+    raw_status = str(acc.get("status") or "")
+    standby_like = raw_status in ("standby", "exhausted")
+    has_trusted_standby_snapshot = (
+        standby_like
+        and isinstance(acc.get("standby_quota_snapshot"), dict)
+        and isinstance(acc.get("quota_snapshot_recorded_at"), (int, float))
+    )
+    if standby_like and not has_trusted_standby_snapshot:
+        # Historical last_quota can be a personal/free login probe or a stale
+        # pre-kick snapshot. It must not leak to the frontend as current Team
+        # quota for standby/exhausted accounts.
+        sanitized.pop("last_quota", None)
     sanitized["is_main_account"] = _is_main_account_email(acc.get("email"))
-    sanitized["raw_status"] = acc.get("status", "")
+    sanitized["raw_status"] = raw_status
     sanitized["status"] = _display_account_status(acc, quota_snapshot)
-    schedule = _account_pool_schedule(acc, quota_snapshot)
+    if live_quota_status:
+        sanitized["live_quota_status"] = live_quota_status
+    if raw_status in ("active", "personal") and live_quota_status in {"auth_error", "network_error"}:
+        sanitized.pop("last_quota", None)
+    schedule = _account_pool_schedule(acc, quota_snapshot, live_quota_status)
     sanitized["pool_schedule"] = schedule
     sanitized["pool_sort_bucket"] = schedule["pool_sort_bucket"]
     sanitized["next_usable_at"] = schedule["next_usable_at"]
@@ -2934,7 +2964,7 @@ def post_account_probe(email: str, params: ProbeAccountParams = ProbeAccountPara
     用 access_token 直接探,不进队列,不抢 Playwright 锁(纯 HTTP 请求)。
     落 last_quota_check_at + last_quota,返回 status_before / status_after。
     """
-    from autoteam.accounts import find_account, load_accounts, update_account
+    from autoteam.accounts import STATUS_AUTH_INVALID, find_account, load_accounts, update_account
     from autoteam.codex_auth import cheap_codex_smoke, check_codex_quota
 
     email = email.strip().lower()
@@ -2997,6 +3027,15 @@ def post_account_probe(email: str, params: ProbeAccountParams = ProbeAccountPara
     update_fields = {"last_quota_check_at": time.time()}
     if quota_status == "ok" and isinstance(quota_info, dict):
         update_fields["last_quota"] = quota_info
+    elif quota_status == "auth_error" and smoke_result == "auth_invalid":
+        update_fields.update(
+            {
+                "status": STATUS_AUTH_INVALID,
+                "auth_last_error": "probe_confirmed_auth_invalid",
+                "auth_last_error_detail": str(smoke_detail)[:500],
+                "_reason": "probe:quota_auth_error_and_smoke_auth_invalid",
+            }
+        )
     try:
         update_account(email, **update_fields)
     except Exception as exc:
@@ -3326,6 +3365,7 @@ def get_status(fast: bool = False):
 
     accounts = load_accounts()
     quota_cache = {}
+    live_quota_status = {}
 
     if not fast:
         for acc in accounts:
@@ -3340,9 +3380,15 @@ def get_status(fast: bool = False):
 
             try:
                 auth_data = json.loads(read_text(Path(auth_file)))
-                access_token = auth_data.get("access_token")
+                access_token = auth_data.get("access_token") or (auth_data.get("tokens") or {}).get("access_token")
+                account_id = (
+                    auth_data.get("account_id")
+                    or (auth_data.get("tokens") or {}).get("account_id")
+                    or acc.get("workspace_account_id")
+                )
                 if access_token:
-                    status, info = check_codex_quota(access_token)
+                    status, info = check_codex_quota(access_token, account_id=account_id)
+                    live_quota_status[acc["email"]] = status
                     if status == "ok" and isinstance(info, dict):
                         quota_cache[acc["email"]] = info
                     elif status == "exhausted":
@@ -3350,9 +3396,16 @@ def get_status(fast: bool = False):
                         if quota_info:
                             quota_cache[acc["email"]] = quota_info
             except Exception:
-                pass
+                live_quota_status[acc["email"]] = "network_error"
 
-    sanitized_accounts = [_sanitize_account(a, quota_cache.get(a.get("email"))) for a in accounts]
+    sanitized_accounts = [
+        _sanitize_account(
+            a,
+            quota_cache.get(a.get("email")),
+            live_quota_status.get(a.get("email")),
+        )
+        for a in accounts
+    ]
     sanitized_accounts.sort(key=_account_pool_sort_key)
 
     summary = {
@@ -3371,6 +3424,7 @@ def get_status(fast: bool = False):
         "accounts": sanitized_accounts,
         "summary": summary,
         "quota_cache": quota_cache,
+        "live_quota_status": live_quota_status,
         "runtime_resources": _safe_runtime_resource_snapshot(),
         "ipv6_pool": _safe_ipv6_pool_status(),
         "cliproxy": _safe_cliproxy_health(timeout=0.5, cache_ttl=30.0) if fast else _safe_cliproxy_health(),
