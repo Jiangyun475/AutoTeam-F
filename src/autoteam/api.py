@@ -2681,7 +2681,24 @@ def _toggle_account_disabled(email: str, disabled: bool):
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
 
-    update_account(email, disabled=bool(disabled))
+    if disabled:
+        update_account(
+            email,
+            disabled=True,
+            disabled_by="manual",
+            disabled_reason="manual",
+            disabled_detail=None,
+            disabled_at=time.time(),
+        )
+    else:
+        update_account(
+            email,
+            disabled=False,
+            disabled_by=None,
+            disabled_reason=None,
+            disabled_detail=None,
+            disabled_at=None,
+        )
     refreshed = find_account(load_accounts(), email)
     action = "禁用" if disabled else "启用"
     return {
@@ -2727,6 +2744,16 @@ def _toggle_accounts_disabled(emails: list[str], disabled: bool):
             unchanged.append(email)
             continue
         acc["disabled"] = bool(disabled)
+        if disabled:
+            acc["disabled_by"] = "manual"
+            acc["disabled_reason"] = "manual"
+            acc["disabled_detail"] = None
+            acc["disabled_at"] = time.time()
+        else:
+            acc["disabled_by"] = None
+            acc["disabled_reason"] = None
+            acc["disabled_detail"] = None
+            acc["disabled_at"] = None
         updated.append(email)
 
     if updated:
@@ -3243,12 +3270,29 @@ def post_account_login(params: LoginAccountParams):
             )
         except RegisterBlocked as blocked:
             if blocked.is_phone:
+                from autoteam.accounts import mark_account_disabled, update_account
+
                 record_failure(
                     email,
                     category="oauth_phone_blocked",
                     reason=f"补登录触发 add-phone (step={blocked.step})",
                     step=blocked.step,
                     stage="api_login",
+                )
+                mark_account_disabled(
+                    email,
+                    reason="phone_required",
+                    by="system",
+                    detail=f"补登录触发 add-phone (step={blocked.step})",
+                    reuse_disabled=True,
+                    retired_reason="phone_required",
+                )
+                update_account(
+                    email,
+                    auth_last_error="add_phone",
+                    auth_last_error_detail=f"补登录触发 add-phone (step={blocked.step})",
+                    auth_retry_after=None,
+                    auth_retry_paused=True,
                 )
                 raise HTTPException(
                     status_code=409,
@@ -3278,12 +3322,21 @@ def post_account_login(params: LoginAccountParams):
             # 否则 Team 子号补登录漂移到 free 时,记录会被指向 free token → 后续拿
             # free token 探团 workspace 必 401 →"认证异常"死循环(本次根因)。
             plan_type = (bundle.get("plan_type") or "").lower()
+            identity_fields = {}
+            try:
+                from autoteam.manager import _chatgpt_user_id_from_auth_data
+
+                chatgpt_user_id = _chatgpt_user_id_from_auth_data(bundle)
+                if chatgpt_user_id:
+                    identity_fields["chatgpt_user_id"] = chatgpt_user_id
+            except Exception:
+                identity_fields = {}
 
             if use_personal:
                 # personal 补登录：期望 plan_type=free,放行覆盖,只刷新 auth_file + 保持 PERSONAL
                 auth_file = save_auth_file(bundle, protect_team=False)
                 update_account(
-                    email, auth_file=auth_file, last_active_at=time.time(), status=STATUS_PERSONAL
+                    email, auth_file=auth_file, last_active_at=time.time(), status=STATUS_PERSONAL, **identity_fields
                 )
             elif plan_type == "team":
                 from autoteam.admin_state import get_chatgpt_account_id
@@ -3295,6 +3348,7 @@ def post_account_login(params: LoginAccountParams):
                     last_active_at=time.time(),
                     status=STATUS_ACTIVE,
                     workspace_account_id=get_chatgpt_account_id() or None,
+                    **identity_fields,
                 )
                 token = bundle.get("access_token")
                 if token:

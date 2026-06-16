@@ -191,6 +191,7 @@ def add_account(
                 "status": STATUS_PENDING,
                 "seat_type": seat_type or SEAT_UNKNOWN,
                 "workspace_account_id": workspace_account_id,  # 邀请时所在的母号 workspace ID,母号切换检测用
+                "chatgpt_user_id": None,  # OpenAI user-... 身份锚点,仅用于隐藏 Team 成员精确匹配
                 # Round 11 V8 — 子号自身的 personal workspace UUID(POST /backend-api/accounts/personal idempotent
                 # getOrCreate),持久化后下次 OAuth 不必再 fetch;失败/旧记录为 None,运行时按需 fetch + 回填。
                 "personal_workspace_id": None,
@@ -199,6 +200,10 @@ def add_account(
                 "quota_resets_at": None,  # 额度恢复时间
                 "last_quota_check_at": None,  # 最近一次 wham/usage 探测时间戳,用于 standby 探测去重
                 "disabled": False,  # 本地禁用:保留记录和 auth_file,但自动化巡检/轮转/同步跳过
+                "disabled_by": None,  # manual/system
+                "disabled_reason": None,
+                "disabled_detail": None,
+                "disabled_at": None,
                 # Round 11 V7 — 双失效探测(access_token + refresh_token 同时被 server-side invalidate):
                 # 主循环周期性调 is_token_pair_invalidated,命中后落该字段供事后排查 / UI 展示。
                 "last_token_pair_invalidated_at": None,
@@ -258,6 +263,37 @@ def update_account(email, **kwargs):
         acc.update(kwargs)
         save_accounts(accounts)
         return acc
+
+
+def mark_account_disabled(
+    email,
+    *,
+    reason: str,
+    by: str = "system",
+    detail: str | None = None,
+    reuse_disabled: bool | None = None,
+    retired_reason: str | None = None,
+    status: str | None = None,
+    now: float | None = None,
+):
+    """Disable an account while preserving why it was disabled."""
+    ts = time.time() if now is None else now
+    fields = {
+        "disabled": True,
+        "disabled_by": by,
+        "disabled_reason": reason,
+        "disabled_at": ts,
+    }
+    if detail is not None:
+        fields["disabled_detail"] = str(detail)[:500]
+    if reuse_disabled is not None:
+        fields["reuse_disabled"] = bool(reuse_disabled)
+    if retired_reason is not None:
+        fields["retired_at"] = ts
+        fields["retired_reason"] = retired_reason
+    if status is not None:
+        fields["status"] = status
+    return update_account(email, **fields)
 
 
 def delete_account(email):
@@ -482,6 +518,7 @@ __all__ = [
     "is_account_disabled",
     "is_supported_plan",
     "load_accounts",
+    "mark_account_disabled",
     "normalize_plan_type",
     "save_accounts",
     "update_account",

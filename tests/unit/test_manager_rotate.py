@@ -106,6 +106,109 @@ def test_remove_from_team_matches_hidden_email_by_auth_user_id(tmp_path, monkeyp
     assert api.deleted == ["user-hidden"]
 
 
+def test_remove_from_team_matches_hidden_email_by_persisted_user_id(monkeypatch):
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        manager,
+        "load_accounts",
+        lambda: [{"email": "yun11@yunfei.life", "chatgpt_user_id": "user-zombie"}],
+    )
+    monkeypatch.setattr(manager, "_auth_search_dirs", lambda: ())
+
+    api = _FakeTeamApi(
+        [
+            {"id": "owner-1", "email": "owner@example.com", "role": "account-owner", "name": "Owner"},
+            {"id": "user-zombie", "email": None, "role": "standard-user", "name": "eleven"},
+        ]
+    )
+
+    result = manager.remove_from_team(
+        api,
+        "yun11@yunfei.life",
+        return_status=True,
+        lookup_retries=0,
+        retry_interval=0,
+    )
+
+    assert result == "removed"
+    assert api.deleted == ["user-zombie"]
+
+
+def test_remove_from_team_matches_hidden_email_by_free_identity_file(tmp_path, monkeypatch):
+    free_file = tmp_path / "codex-yun11@yunfei.life-free-abc123.json"
+    free_file.write_text(
+        json.dumps({"access_token": _jwt_with_chatgpt_user_id("user-free-identity")}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct-1")
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        manager,
+        "load_accounts",
+        lambda: [{"email": "yun11@yunfei.life", "auth_file": None}],
+    )
+    monkeypatch.setattr(manager, "_auth_search_dirs", lambda: (tmp_path,))
+
+    api = _FakeTeamApi(
+        [
+            {"id": "owner-1", "email": "owner@example.com", "role": "account-owner", "name": "Owner"},
+            {"id": "user-free-identity", "email": None, "role": "standard-user", "name": "eleven"},
+        ]
+    )
+
+    result = manager.remove_from_team(
+        api,
+        "yun11@yunfei.life",
+        return_status=True,
+        lookup_retries=0,
+        retry_interval=0,
+    )
+
+    assert result == "removed"
+    assert api.deleted == ["user-free-identity"]
+
+
+def test_cleanup_failed_created_account_keeps_phone_disabled_record(monkeypatch):
+    events = []
+    account = {
+        "email": "phone@example.com",
+        "status": manager.STATUS_AUTH_INVALID,
+        "disabled": True,
+        "disabled_reason": "phone_required",
+    }
+
+    monkeypatch.setattr(manager, "load_accounts", lambda: [dict(account)])
+    monkeypatch.setattr(
+        manager,
+        "_disable_account_for_phone_verification",
+        lambda email, **kwargs: events.append(("disable_phone", email, kwargs.get("status"))),
+    )
+    monkeypatch.setattr(
+        manager,
+        "remove_from_team",
+        lambda _api, email, **_kwargs: events.append(("remove", email)) or "removed",
+    )
+    monkeypatch.setattr(
+        manager,
+        "delete_managed_account",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("phone-disabled record must be kept")),
+    )
+
+    api = _FakeChatGPT()
+    manager._cleanup_failed_created_account(
+        "phone@example.com",
+        None,
+        None,
+        "invite_registration_failed",
+        chatgpt_api=api,
+    )
+
+    assert ("disable_phone", "phone@example.com", manager.STATUS_AUTH_INVALID) in events
+    assert ("remove", "phone@example.com") in events
+
+
 def test_cmd_rotate_skips_google_accounts_during_auto_reuse(monkeypatch):
     import autoteam.config as config
 

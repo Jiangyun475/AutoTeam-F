@@ -55,6 +55,7 @@ from autoteam.accounts import (
     is_account_disabled,
     is_supported_plan,
     load_accounts,
+    mark_account_disabled,
     save_accounts,
     update_account,
     _standby_cooldown_until,
@@ -570,21 +571,34 @@ def _release_account_ipv6_proxy(email: str | None) -> None:
         logger.warning("[IPv6Pool] release failed for %s: %s", email, exc)
 
 
-def _discard_auth_repair_failed_account_record(
+def _should_auto_disable_auth_repair_failure(error_type: str | None) -> bool:
+    """Only phone verification is allowed to auto-disable a local account."""
+    return str(error_type or "").strip() == "add_phone"
+
+
+def _disable_account_for_phone_verification(
     email: str,
-    reason: str,
     *,
-    status: str = STATUS_STANDBY,
+    detail: str | None = None,
+    status: str | None = None,
     now: float | None = None,
 ) -> None:
-    """Mark a released auth-repair failure as non-reusable while keeping local evidence."""
+    mark_account_disabled(
+        email,
+        reason="phone_required",
+        by="system",
+        detail=detail or "add_phone",
+        status=status,
+        reuse_disabled=True,
+        retired_reason="phone_required",
+        now=time.time() if now is None else now,
+    )
     update_account(
         email,
-        status=status,
-        disabled=True,
-        reuse_disabled=True,
-        retired_at=time.time() if now is None else now,
-        retired_reason=reason,
+        auth_last_error="add_phone",
+        auth_last_error_detail=detail or "phone_required",
+        auth_retry_after=None,
+        auth_retry_paused=True,
     )
     _release_account_ipv6_proxy(email)
 
@@ -1134,12 +1148,17 @@ def _record_auth_repair_failure(
     # 走 default_machine.transition 时映射到 AccountState.AUTH_PENDING.
     final_status = STATUS_STANDBY if seat_released or not is_team_member else STATUS_AUTH_INVALID
     update_account(email, status=final_status, _reason=f"auth_repair:{error_type}")
-    if discard_failed_repair and final_status == STATUS_STANDBY and (
-        not protected_local_credential or protected_replacement_override
+    if (
+        discard_failed_repair
+        and final_status == STATUS_STANDBY
+        and _should_auto_disable_auth_repair_failure(error_type)
+        and (
+            not protected_local_credential or protected_replacement_override
+        )
     ):
-        _discard_auth_repair_failed_account_record(
+        _disable_account_for_phone_verification(
             email,
-            f"auth_repair_failed:{error_type}",
+            detail=f"auth_repair_failed:{error_type}",
             status=STATUS_STANDBY,
             now=now,
         )
@@ -1485,8 +1504,13 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
             role = (team_member_role(m) or "").strip().lower()
             if role == "account-owner" or _is_main_account_email(email):
                 continue
+            member_user_id = team_member_user_id(m)
+            if email:
+                matched_acc = by_email.get(email.lower())
+                patch = _chatgpt_user_id_account_patch(matched_acc, member_user_id)
+                if matched_acc and patch:
+                    _safe_update(matched_acc.get("email"), **patch)
             if not email:
-                member_user_id = team_member_user_id(m)
                 matched_acc = by_user_id.get(str(member_user_id or ""))
                 if matched_acc:
                     email = (matched_acc.get("email") or "").lower()
@@ -1793,6 +1817,7 @@ def sync_account_states(chatgpt_api=None):
         members = data.get("items", data.get("users", data.get("members", [])))
         team_emails = set()
         team_user_ids = set()
+        team_user_id_by_email = {}
         for m in members:
             email = team_member_email(m)
             role = (team_member_role(m) or "").strip().lower()
@@ -1803,6 +1828,8 @@ def sync_account_states(chatgpt_api=None):
             member_user_id = team_member_user_id(m)
             if member_user_id:
                 team_user_ids.add(str(member_user_id))
+                if email:
+                    team_user_id_by_email[email.lower()] = str(member_user_id)
         anonymous_team_sub_slots = sum(
             1
             for m in members
@@ -1867,6 +1894,13 @@ def sync_account_states(chatgpt_api=None):
         email = acc["email"].lower()
         auth_user_id = _chatgpt_user_id_for_email(email)
         in_team = email in team_emails or bool(auth_user_id and auth_user_id in team_user_ids)
+        identity_patch = _chatgpt_user_id_account_patch(acc, team_user_id_by_email.get(email))
+        if identity_patch:
+            try:
+                update_account(acc["email"], **identity_patch)
+                acc.update(identity_patch)
+            except Exception as exc:
+                logger.warning("[同步] 写入 %s chatgpt_user_id 失败: %s", acc["email"], exc)
 
         if in_team and acc["status"] in (STATUS_STANDBY, STATUS_PENDING, "auth_pending"):
             if email not in team_emails and auth_user_id:
@@ -2064,6 +2098,7 @@ def sync_account_states(chatgpt_api=None):
                     "cloudmail_account_id": None,
                     "status": status,
                     "auth_file": str(auth_file),
+                    "chatgpt_user_id": auth_user_id or None,
                     "quota_exhausted_at": None,
                     "quota_resets_at": None,
                     "created_at": time.time(),
@@ -2910,6 +2945,9 @@ def _probe_standby_quota():
 
 def _chatgpt_user_id_from_auth_data(auth_data: dict | None) -> str:
     auth_data = auth_data or {}
+    direct = str(auth_data.get("chatgpt_user_id") or auth_data.get("user_id") or "").strip()
+    if direct.startswith("user-"):
+        return direct
     for token_key in ("access_token", "id_token"):
         token = str(auth_data.get(token_key) or "")
         parts = token.split(".")
@@ -2928,12 +2966,68 @@ def _chatgpt_user_id_from_auth_data(auth_data: dict | None) -> str:
     return ""
 
 
+def _chatgpt_user_id_from_bundle(bundle: dict | None) -> str:
+    bundle = bundle or {}
+    direct = str(bundle.get("chatgpt_user_id") or bundle.get("user_id") or "").strip()
+    if direct.startswith("user-"):
+        return direct
+    return _chatgpt_user_id_from_auth_data(
+        {
+            "access_token": bundle.get("access_token"),
+            "id_token": bundle.get("id_token"),
+        }
+    )
+
+
+def _chatgpt_user_id_update_fields(bundle: dict | None) -> dict:
+    user_id = _chatgpt_user_id_from_bundle(bundle)
+    return {"chatgpt_user_id": user_id} if user_id else {}
+
+
+def _chatgpt_user_id_account_patch(acc: dict | None, user_id: str | None) -> dict:
+    user_id = str(user_id or "").strip()
+    if not user_id.startswith("user-"):
+        return {}
+    current = str((acc or {}).get("chatgpt_user_id") or "").strip()
+    if not current:
+        return {"chatgpt_user_id": user_id}
+    if current != user_id:
+        logger.warning(
+            "[Team] %s 已有 chatgpt_user_id=%s,远端返回 %s；保留本地值不覆盖",
+            (acc or {}).get("email") or "<unknown>",
+            current,
+            user_id,
+        )
+    return {}
+
+
+def _auth_file_chatgpt_user_id(auth_file: str | Path | None) -> str:
+    auth_path = _resolve_auth_file_path(str(auth_file or ""))
+    if not auth_path.exists():
+        return ""
+    try:
+        return _chatgpt_user_id_from_auth_data(json.loads(read_text(auth_path)))
+    except Exception as exc:
+        logger.info("[Team] 解析 auth JWT user_id 失败: %s (%s)", auth_path, exc)
+        return ""
+
+
+def _identity_fallback_auth_files_for_email(email_lc: str) -> list[Path]:
+    """Return any plan auth files for identity-only matching, never credential use."""
+    candidates: list[Path] = []
+    for auth_dir in _auth_search_dirs():
+        if auth_dir.exists():
+            candidates.extend(sorted(auth_dir.glob(f"codex-{email_lc}-*.json")))
+    return candidates
+
+
 def _chatgpt_user_id_for_email(email: str | None) -> str:
     email_lc = (email or "").strip().lower()
     if not email_lc:
         return ""
 
     auth_file = ""
+    account = None
     try:
         account = find_account(load_accounts(), email_lc)
         auth_file = (account or {}).get("auth_file") or ""
@@ -2945,17 +3039,27 @@ def _chatgpt_user_id_for_email(email: str | None) -> str:
             auth_file = _find_team_auth_file(email_lc) or ""
         except Exception:
             auth_file = ""
-    if not auth_file:
-        return ""
+    if auth_file:
+        user_id = _auth_file_chatgpt_user_id(auth_file)
+        if user_id:
+            return user_id
 
-    auth_path = _resolve_auth_file_path(auth_file)
-    if not auth_path.exists():
-        return ""
-    try:
-        return _chatgpt_user_id_from_auth_data(json.loads(read_text(auth_path)))
-    except Exception as exc:
-        logger.info("[Team] 解析 %s 的 auth JWT user_id 失败: %s", email_lc, exc)
-        return ""
+    stored_user_id = str((account or {}).get("chatgpt_user_id") or "").strip()
+    if stored_user_id.startswith("user-"):
+        return stored_user_id
+
+    # Identity-only fallback for legacy zombie seats: a free/personal auth JWT
+    # can identify the same OpenAI user, but must never be used as a Team token.
+    seen: set[str] = set()
+    for auth_path in _identity_fallback_auth_files_for_email(email_lc):
+        key = str(auth_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        user_id = _auth_file_chatgpt_user_id(auth_path)
+        if user_id:
+            return user_id
+    return ""
 
 
 def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=3, retry_interval=3.0):
@@ -3373,10 +3477,10 @@ def _cancel_stale_pending_invites_for_capacity(chatgpt_api, *, stage_label: str 
             except Exception as exc:
                 logger.warning("%s 清理 pending invite 本地账号失败: %s (%s)", stage_label, email, exc)
                 try:
-                    _discard_auth_repair_failed_account_record(
+                    update_account(
                         email,
-                        "stale_pending_invite_cancelled",
                         status=STATUS_STANDBY,
+                        standby_reason="stale_pending_invite_cancelled",
                     )
                 except Exception:
                     pass
@@ -3840,6 +3944,11 @@ def _run_post_register_oauth(
                 workspace_account_id=get_chatgpt_account_id() or None,
             )
             _kick_team_seat_after_oauth_failure(email, reason="register_blocked_phone")
+            _disable_account_for_phone_verification(
+                email,
+                detail=f"Team OAuth 阶段触发 add-phone (step={blocked.step})",
+                status=STATUS_AUTH_INVALID,
+            )
             _record_outcome("oauth_phone_blocked", reason="OAuth 阶段触发 add-phone")
             return None
         record_failure(email, "exception", f"Team OAuth RegisterBlocked: {blocked.reason}",
@@ -3858,6 +3967,7 @@ def _run_post_register_oauth(
         )
         auth_file = save_auth_file(bundle)
         bundle_plan = bundle.get("plan_type", "unknown")  # 已被 _exchange_auth_code 归一化为小写
+        identity_fields = _chatgpt_user_id_update_fields(bundle)
 
         if not plan_supported:
             logger.error(
@@ -3878,6 +3988,7 @@ def _run_post_register_oauth(
                 auth_file=auth_file,
                 plan_type_raw=bundle.get("plan_type_raw"),
                 workspace_account_id=get_chatgpt_account_id() or None,
+                **identity_fields,
             )
             _kick_team_seat_after_oauth_failure(email, reason="plan_unsupported")
             _record_outcome("plan_unsupported", plan=bundle_plan)
@@ -3895,6 +4006,7 @@ def _run_post_register_oauth(
             "workspace_account_id": get_chatgpt_account_id() or None,
             "plan_type_raw": bundle.get("plan_type_raw"),
         }
+        update_fields.update(identity_fields)
 
         if access_token:
             try:
@@ -4297,10 +4409,25 @@ def _cleanup_failed_created_account(
         return
 
     logger.warning("[创建] 丢弃失败新账号: %s（%s）", email, reason)
-    try:
-        _discard_auth_repair_failed_account_record(email, reason, status=STATUS_STANDBY)
-    except Exception:
-        pass
+    existing = find_account(load_accounts(), email) or {}
+    phone_blocked = (
+        str(existing.get("disabled_reason") or "") == "phone_required"
+        or "add_phone" in str(reason or "").lower()
+        or "phone" in str(reason or "").lower()
+    )
+    if phone_blocked:
+        try:
+            _disable_account_for_phone_verification(email, detail=reason, status=STATUS_AUTH_INVALID)
+        except Exception:
+            pass
+        try:
+            if chatgpt_api is not None:
+                if not _chatgpt_session_ready(chatgpt_api):
+                    chatgpt_api.start()
+                remove_from_team(chatgpt_api, email, return_status=True)
+        except Exception as exc:
+            logger.warning("[创建] phone-blocked 账号释放 Team 残留席位失败: %s (%s)", email, exc)
+        return
 
     try:
         if chatgpt_api is not None and not _chatgpt_session_ready(chatgpt_api):
@@ -6064,15 +6191,17 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     except RegisterBlocked as exc:
         # OAuth 阶段触发 add-phone / 双重验证 / 重复账号风控 — 不可恢复,锁 AUTH_INVALID
         # 而非 STANDBY,避免下一轮 rotate 又选中它死循环。
-        logger.warning("[轮转] %s reinvite OAuth 被 add-phone/duplicate 阻断: %s", email, exc)
-        _cleanup_team_leftover("oauth_phone_blocked")
+        is_phone_block = bool(getattr(exc, "is_phone", False))
+        failure_reason = "oauth_phone_blocked" if is_phone_block else "oauth_register_blocked"
+        logger.warning("[轮转] %s reinvite OAuth 被 RegisterBlocked 阻断(%s): %s", email, failure_reason, exc)
+        _cleanup_team_leftover(failure_reason)
         update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
         # Round 12 wire-up (C1) — 记录 auth_retry_* 状态字段(衰退式 retry / pause).
         # 注意调用顺序: 已经 _cleanup_team_leftover 过, _record_auth_repair_failure 内
         # 的 _release_auth_repair_team_seat 走 already_absent 路径, 不会重复 kick.
         try:
             _record_auth_repair_failure(
-                email, error_type="add_phone",
+                email, error_type="add_phone" if is_phone_block else "login_failed",
                 error_detail=str(exc),
                 chatgpt_api=chatgpt_api,
             )
@@ -6081,9 +6210,15 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
                 email, repair_exc,
             )
+        if is_phone_block:
+            _disable_account_for_phone_verification(
+                email,
+                detail=str(exc),
+                status=STATUS_AUTH_INVALID,
+            )
         try:
             from autoteam.register_failures import record_failure
-            record_failure(email, "oauth_phone_blocked", stage="reinvite_account", detail=str(exc))
+            record_failure(email, failure_reason, stage="reinvite_account", detail=str(exc))
         except Exception:
             pass
         return False
@@ -6108,12 +6243,13 @@ def reinvite_account(chatgpt_api, mail_client, acc):
 
     plan_type_raw = bundle.get("plan_type_raw") or bundle.get("plan_type") or ""
     plan_type = (bundle.get("plan_type") or "").lower()
+    identity_fields = _chatgpt_user_id_update_fields(bundle)
     if not is_supported_plan(plan_type_raw):
         # plan_type 不在白名单(self_serve_business_usage_based / enterprise / unknown 等)
         # → 这种账号即使 OAuth 成功也无法稳定调用 Codex,锁 AUTH_INVALID 而非 standby。
         logger.warning("[轮转] %s reinvite 后 plan_type=%s 不被支持,标 AUTH_INVALID", email, plan_type_raw)
         _cleanup_team_leftover(f"plan_unsupported={plan_type_raw}")
-        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None, **identity_fields)
         # Round 12 wire-up (C1) — plan_unsupported 为永久失败, 走衰退式 retry 不
         # 立刻无限循环(实际更可能等下次 OAuth 拿到正确 plan).
         try:
@@ -6139,7 +6275,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         # 是个人 plan,反复 reinvite 也不会变 team。锁 AUTH_INVALID 让下游清账,不再死循环。
         logger.warning("[轮转] %s reinvite 后 plan=%s 漂移,不是 team,标 AUTH_INVALID", email, plan_type or "unknown")
         _cleanup_team_leftover(f"plan_drift={plan_type or 'unknown'}")
-        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None, **identity_fields)
         # Round 12 wire-up (C1) — 同 plan_unsupported, 走衰退式 retry.
         try:
             _record_auth_repair_failure(
@@ -6274,6 +6410,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 standby_reason=f"fake_recovery_{fail_reason}",
                 standby_quota_snapshot=failed_quota_snapshot,
                 quota_snapshot_recorded_at=now_ts,
+                **identity_fields,
             )
         elif fail_reason == "no_quota_assigned":
             # 后端没发配额 —— 不是耗尽,锁 5h 没用,锁 AUTH_INVALID 让下游清账。
@@ -6283,6 +6420,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 auth_file=None,
                 quota_exhausted_at=None,
                 quota_resets_at=None,
+                **identity_fields,
             )
             try:
                 from autoteam.register_failures import record_failure
@@ -6305,6 +6443,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 quota_cooldown_until=None,
                 standby_since=now_ts,
                 standby_reason=f"fake_recovery_{fail_reason}",
+                **identity_fields,
             )
         return False
 
@@ -6314,6 +6453,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         last_active_at=time.time(),
         auth_file=auth_file,
         workspace_account_id=get_chatgpt_account_id() or None,
+        **identity_fields,
     )
     # Round 12 wire-up (C1) — 注册/复用成功后清空 auth_repair 状态字段,
     # 避免历史 auth_retry_* 累积影响下次 cmd_rotate 跳过判断.

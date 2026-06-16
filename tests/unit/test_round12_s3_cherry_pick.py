@@ -694,12 +694,16 @@ class TestRecordAuthRepairFailure:
         acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
         assert acc["disabled"] is True
         assert acc["reuse_disabled"] is True
-        assert acc["retired_reason"] == "auth_repair_failed:add_phone"
+        assert acc["disabled_by"] == "system"
+        assert acc["disabled_reason"] == "phone_required"
+        assert acc["retired_reason"] == "phone_required"
+        assert acc["auth_last_error"] == "add_phone"
+        assert acc["auth_retry_paused"] is True
 
-    def test_repeated_email_verification_releases_and_disables(
+    def test_repeated_email_verification_releases_without_disabling(
         self, seeded_account, monkeypatch
     ):
-        """email_verification exhausts retry budget → release seat and disable reuse."""
+        """email_verification exhausts retry budget → release seat but do not auto-disable."""
         monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
@@ -724,15 +728,15 @@ class TestRecordAuthRepairFailure:
         assert result["seat_released"] is True
         assert result["status"] == accounts_mod.STATUS_STANDBY
         acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
-        assert acc["disabled"] is True
-        assert acc["reuse_disabled"] is True
-        assert acc["retired_at"] == 1_700_000_000
-        assert acc["retired_reason"] == "auth_repair_failed:email_verification"
+        assert acc["disabled"] is False
+        assert acc.get("reuse_disabled") is not True
+        assert acc.get("retired_at") is None
+        assert acc.get("retired_reason") is None
 
-    def test_login_state_lost_releases_missing_auth_and_disables(
+    def test_login_state_lost_releases_missing_auth_without_disabling(
         self, seeded_account, monkeypatch
     ):
-        """login_state_lost without local auth is a Team blocker when skip-reuse is enabled."""
+        """login_state_lost can release a Team blocker but must not auto-disable."""
         monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
@@ -752,8 +756,8 @@ class TestRecordAuthRepairFailure:
         assert result["protected_local_credential"] is False
         assert result["status"] == accounts_mod.STATUS_STANDBY
         acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
-        assert acc["disabled"] is True
-        assert acc["retired_reason"] == "auth_repair_failed:login_state_lost"
+        assert acc["disabled"] is False
+        assert acc.get("retired_reason") is None
 
     @pytest.mark.parametrize(
         "error_type",
@@ -762,7 +766,7 @@ class TestRecordAuthRepairFailure:
     def test_aggressive_login_link_failures_release_child(
         self, seeded_account, monkeypatch, error_type
     ):
-        """One-shot login/link failures should release managed child capacity under skip-reuse."""
+        """One-shot login/link failures release capacity but do not auto-disable."""
         monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
@@ -785,9 +789,9 @@ class TestRecordAuthRepairFailure:
         assert result["seat_released"] is True
         assert result["status"] == accounts_mod.STATUS_STANDBY
         acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
-        assert acc["disabled"] is True
-        assert acc["reuse_disabled"] is True
-        assert acc["retired_reason"] == f"auth_repair_failed:{error_type}"
+        assert acc["disabled"] is False
+        assert acc.get("reuse_disabled") is not True
+        assert acc.get("retired_reason") is None
 
     def test_login_state_lost_preserves_protected_local_credential(
         self, isolated_accounts, tmp_path, monkeypatch
@@ -863,10 +867,10 @@ class TestRecordAuthRepairFailure:
         assert result["status"] == accounts_mod.STATUS_STANDBY
         acc = accounts_mod.find_account(accounts_mod.load_accounts(), "managed@example.com")
         assert acc["status"] == accounts_mod.STATUS_STANDBY
-        assert acc["disabled"] is True
-        assert acc["reuse_disabled"] is True
-        assert acc["retired_at"] == 1_700_000_000
-        assert acc["retired_reason"] == "auth_repair_failed:auth_error_discard"
+        assert acc["disabled"] is False
+        assert acc.get("reuse_disabled") is not True
+        assert acc.get("retired_at") is None
+        assert acc.get("retired_reason") is None
 
     def test_failure_when_not_in_team_lands_standby(
         self, seeded_account, monkeypatch

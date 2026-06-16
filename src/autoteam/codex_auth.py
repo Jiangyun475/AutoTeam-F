@@ -359,6 +359,7 @@ def _exchange_auth_code(auth_code, code_verifier, fallback_email=None):
         "refresh_token": token_data.get("refresh_token"),
         "id_token": id_token,
         "account_id": auth_claims.get("chatgpt_account_id", ""),
+        "chatgpt_user_id": auth_claims.get("chatgpt_user_id") or auth_claims.get("user_id") or "",
         "email": claims.get("email", fallback_email or ""),
         # SPEC-2 shared/plan-type-whitelist §2.3:plan_type 已归一化为小写;
         # plan_type_raw 保留 OpenAI 原始字面量便于事后排查;
@@ -532,6 +533,7 @@ def _bundle_from_access_token(access_token, email, account_id):
         "refresh_token": "",
         "id_token": access_token,
         "account_id": resolved_account_id,
+        "chatgpt_user_id": auth_claims.get("chatgpt_user_id") or auth_claims.get("user_id") or "",
         "email": resolved_email,
         "plan_type": normalize_plan_type(raw_plan),
         "plan_type_raw": raw_plan,
@@ -960,6 +962,7 @@ def _write_auth_file(filepath, bundle):
         "access_token": bundle.get("access_token", ""),
         "refresh_token": bundle.get("refresh_token", ""),
         "account_id": bundle.get("account_id", ""),
+        "chatgpt_user_id": bundle.get("chatgpt_user_id", ""),
         "email": bundle.get("email", ""),
         "expired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(bundle.get("expired", 0))),
         "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
