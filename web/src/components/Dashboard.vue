@@ -559,6 +559,7 @@ function nextUsableText(acc) {
 }
 
 function nextUsableReason(acc) {
+  if (acc.disabled_reason === 'phone_required') return '手机号验证'
   const map = {
     main_account: '母号',
     active_5h_reset: '当前使用中',

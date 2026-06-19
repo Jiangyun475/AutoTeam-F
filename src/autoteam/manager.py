@@ -1003,9 +1003,9 @@ def _record_auth_repair_failure(
 ) -> dict:
     """OAuth 修复失败 → 写衰退式 retry_after 状态 + 决定是否释放 Team 席位.
 
-    上游 `.upstream/manager.py:349`. 三分支:
-      1. add_phone + 软重试开 + 未超限 → 指数退避 retry_after, paused=False
-      2. add_phone(超限) | hard_failure → paused=True + 释放席位
+    上游 `.upstream/manager.py:349`. 本地边界:
+      1. add_phone 是账号级终态 → paused=True + 释放席位 + 禁用账号
+      2. hard_failure → paused=True + 释放席位
       3. 普通错误 → 衰退式三档 retry_after, paused=False
 
     本地适配:
@@ -1039,32 +1039,18 @@ def _record_auth_repair_failure(
             "auth_retry_paused": True,
         }
         release_team_seat = True
-    elif error_type == "add_phone" and _auth_repair_retry_add_phone_enabled():
+    elif error_type == "add_phone":
         prev_count = int(acc.get("auth_retry_count") or 0) if acc.get("auth_last_error") == "add_phone" else 0
-        next_count = prev_count + 1
-        max_retries = _auth_repair_add_phone_max_retries()
-        add_phone_delays = _auth_repair_add_phone_retry_delays(max_retries)
-
-        if next_count > max_retries:
-            state = {
-                "auth_retry_count": next_count,
-                "auth_last_error": error_type,
-                "auth_last_error_detail": error_detail,
-                "auth_last_failed_at": now,
-                "auth_retry_after": None,
-                "auth_retry_paused": True,
-            }
-            release_team_seat = True
-        else:
-            state = {
-                "auth_retry_count": next_count,
-                "auth_last_error": error_type,
-                "auth_last_error_detail": error_detail,
-                "auth_last_failed_at": now,
-                "auth_retry_after": now + add_phone_delays[next_count - 1],
-                "auth_retry_paused": False,
-            }
-    elif error_type in AUTH_REPAIR_HARD_FAILURE_TYPES or error_type == "add_phone":
+        state = {
+            "auth_retry_count": prev_count + 1,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": None,
+            "auth_retry_paused": True,
+        }
+        release_team_seat = True
+    elif error_type in AUTH_REPAIR_HARD_FAILURE_TYPES:
         retry_count = max(int(acc.get("auth_retry_count") or 0), len(retry_delays))
         state = {
             "auth_retry_count": retry_count,
@@ -1148,18 +1134,11 @@ def _record_auth_repair_failure(
     # 走 default_machine.transition 时映射到 AccountState.AUTH_PENDING.
     final_status = STATUS_STANDBY if seat_released or not is_team_member else STATUS_AUTH_INVALID
     update_account(email, status=final_status, _reason=f"auth_repair:{error_type}")
-    if (
-        discard_failed_repair
-        and final_status == STATUS_STANDBY
-        and _should_auto_disable_auth_repair_failure(error_type)
-        and (
-            not protected_local_credential or protected_replacement_override
-        )
-    ):
+    if _should_auto_disable_auth_repair_failure(error_type) and not _is_main_account_email(email):
         _disable_account_for_phone_verification(
             email,
             detail=f"auth_repair_failed:{error_type}",
-            status=STATUS_STANDBY,
+            status=final_status,
             now=now,
         )
 
@@ -1238,6 +1217,15 @@ def _login_codex_with_result(
                 mail_client=mail_client,
                 return_result=True,
             )
+        except RegisterBlocked as exc:
+            is_phone_block = bool(getattr(exc, "is_phone", False))
+            return {
+                "ok": False,
+                "bundle": None,
+                "error_type": "add_phone" if is_phone_block else "login_failed",
+                "error_detail": str(exc),
+                "retryable": False,
+            }
         except Exception as exc:
             return {
                 "ok": False,

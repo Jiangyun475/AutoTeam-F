@@ -2765,6 +2765,15 @@ def login_codex_via_browser(
 
             _screenshot(page, f"codex_04_step{step + 1}_before.png")
 
+            # auth code 已捕获 = OAuth 实质完成,此刻页面正在 redirect/可能无响应
+            # (screenshot 都超时即页面无响应)。继续在其上做 choose_account/workspace
+            # 检测会触发 CDP 级 hang(Playwright timeout 对 CDP 卡死不生效),曾导致
+            # reinvite 卡死 ~7 分钟、占住 Playwright 锁堵死整个服务。这里及早 break,
+            # 直接去用 auth_code 换 token —— 等价于"kill 浏览器后自然完成"但无需人工。
+            if auth_code:
+                logger.info("[Codex] auth code 已捕获,跳出 consent 循环 (step %d)", step + 1)
+                break
+
             try:
                 if _is_choose_account_page(page):
                     _screenshot(page, f"codex_04_choose_account_{step + 1}_before.png")

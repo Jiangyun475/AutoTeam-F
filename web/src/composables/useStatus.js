@@ -170,6 +170,9 @@ export function computeUsability(acc) {
     return { kind: 'unknown', label: '网络未知', hint: '实时 quota 探测失败，保留本地状态', tone: 'neutral' }
   }
   if (s === 'disabled') {
+    if (acc.disabled_reason === 'phone_required') {
+      return { kind: 'unusable', label: '已作废', hint: '触发手机号验证', tone: 'rose' }
+    }
     return { kind: 'standby', label: '禁用', hint: '已从自动化流程排除', tone: 'neutral' }
   }
   const q = acc.last_quota || {}

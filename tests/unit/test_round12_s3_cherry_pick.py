@@ -8,7 +8,7 @@ Verifies the ✓ paste / ⚠ adapt items from the S0 diff report
 3. Pool counting helpers (_pool_active_target / _count_pool_active_accounts /
    _count_local_team_seat_accounts / _estimate_local_team_member_count)
 4. _release_auth_repair_team_seat
-5. _record_auth_repair_failure (3 branches: add_phone soft retry / hard pause / decay)
+5. _record_auth_repair_failure (3 branches: add_phone disable / hard pause / decay)
 6. _auth_repair_skip_reason / _auth_repair_state_suffix / _auth_repair_reset
 7. _login_codex_with_result result-shape and retry guard
 
@@ -27,6 +27,7 @@ import pytest
 from autoteam import accounts as accounts_mod
 from autoteam import manager as manager_mod
 from autoteam.account_state import default_machine
+from autoteam.invite import RegisterBlocked
 from autoteam.signup_profile import (
     MAX_SIGNUP_AGE,
     MIN_SIGNUP_AGE,
@@ -457,6 +458,28 @@ class TestLoginCodexWithResult:
         assert result["error_type"] == error_type
         assert result["attempts"] == 1
 
+    def test_register_blocked_phone_maps_to_add_phone_without_retry(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def fake_login(email, password, mail_client=None, return_result=False):
+            assert return_result is True
+            attempts["count"] += 1
+            raise RegisterBlocked(
+                "oauth",
+                "phone verification required",
+                is_phone=True,
+            )
+
+        monkeypatch.setattr(manager_mod, "login_codex_via_browser", fake_login)
+
+        result = manager_mod._login_codex_with_result("user@example.com", "", max_attempts=3)
+
+        assert attempts["count"] == 1
+        assert result["ok"] is False
+        assert result["error_type"] == "add_phone"
+        assert result["retryable"] is False
+        assert result["attempts"] == 1
+
     def test_rejects_non_team_bundle(self, monkeypatch):
         def fake_login(email, password, mail_client=None, return_result=False):
             assert return_result is True
@@ -479,7 +502,7 @@ class TestLoginCodexWithResult:
 
 
 class TestCmdCheckAuthRepairEntry:
-    def test_preserves_historical_low_quota_on_network_error_for_remove_first(self, tmp_path, monkeypatch):
+    def test_does_not_preserve_historical_low_quota_on_network_error(self, tmp_path, monkeypatch):
         auth_file = tmp_path / "codex-low@example.com-team.json"
         auth_file.write_text('{"access_token": "token"}', encoding="utf-8")
         account = {
@@ -509,13 +532,7 @@ class TestCmdCheckAuthRepairEntry:
         exhausted = manager_mod.cmd_check(preserve_low_active=True, preserved_low_accounts=preserved)
 
         assert exhausted == []
-        assert preserved == [
-            {
-                "email": "low@example.com",
-                "remaining": 5,
-                "quota": account["last_quota"],
-            }
-        ]
+        assert preserved == []
         assert updates == []
 
     def test_force_auth_repair_ignores_cooldown_for_auth_pending(self, monkeypatch):
@@ -644,29 +661,42 @@ class TestRecordAuthRepairFailure:
         assert result["status"] == accounts_mod.STATUS_STANDBY
         assert release_calls == [seeded_account]
 
-    def test_add_phone_soft_retry_within_limit(
+    def test_add_phone_immediately_pauses_releases_and_disables(
         self, seeded_account, monkeypatch
     ):
-        """add_phone (软重试开 + 未超限) → paused=False + retry_after."""
+        """add_phone 是账号级终态 → 首次命中也要暂停、释放席位并禁用账号。"""
         monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", False)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         monkeypatch.setenv("AUTO_CHECK_RETRY_ADD_PHONE", "1")
         monkeypatch.setenv("AUTO_CHECK_ADD_PHONE_MAX_RETRIES", "3")
+        monkeypatch.setattr(
+            manager_mod, "_release_auth_repair_team_seat",
+            lambda email, **kw: "removed",
+        )
 
         result = manager_mod._record_auth_repair_failure(
             seeded_account, error_type="add_phone"
         )
 
-        assert result["auth_retry_paused"] is False
-        assert result["auth_retry_after"] is not None
+        assert result["auth_retry_paused"] is True
+        assert result["auth_retry_after"] is None
         assert result["auth_retry_count"] == 1
-        assert result["release_attempted"] is False
-        assert result["status"] == accounts_mod.STATUS_AUTH_INVALID
+        assert result["release_attempted"] is True
+        assert result["seat_released"] is True
+        assert result["status"] == accounts_mod.STATUS_STANDBY
+        acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
+        assert acc["disabled"] is True
+        assert acc["reuse_disabled"] is True
+        assert acc["disabled_by"] == "system"
+        assert acc["disabled_reason"] == "phone_required"
+        assert acc["retired_reason"] == "phone_required"
+        assert acc["auth_last_error"] == "add_phone"
+        assert acc["auth_retry_paused"] is True
 
     def test_add_phone_exceeds_limit_pauses_and_releases(
         self, seeded_account, monkeypatch
     ):
-        """add_phone 超过 max_retries → paused=True + 释放席位."""
+        """历史上已有 add_phone 失败时仍保持禁用终态。"""
         monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         # Pre-seed 3 prior add_phone failures
