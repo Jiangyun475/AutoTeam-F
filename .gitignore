@@ -23,6 +23,7 @@ web/node_modules/
 runtime_config.json
 register_failures.json
 mail_provider_state.json
+data/*.log
 *.bak-*
 auths.bak-*/
 .backup_docker/
